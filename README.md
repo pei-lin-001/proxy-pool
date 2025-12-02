@@ -272,6 +272,42 @@ Access `http://localhost:9090` to view:
 - Release blacklisted nodes
 - **One-click Export**: Export all available nodes as proxy URIs (`http://user:pass@host:port`)
 
+### Node Management
+
+The Web UI provides a **Node Management** tab for CRUD operations on proxy nodes:
+
+- **Add Node**: Add new proxy nodes via URI (name auto-extracted from URI fragment)
+- **Edit Node**: Modify existing node configuration
+- **Delete Node**: Remove nodes from configuration
+- **Reload Config**: Apply changes by restarting sing-box core (⚠️ interrupts connections)
+
+In Multi-Port mode, ports are automatically allocated from `base_port`.
+
+**API Endpoints:**
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/nodes/config` | List all configured nodes |
+| POST | `/api/nodes/config` | Add a new node |
+| PUT | `/api/nodes/config/:name` | Update node by name |
+| DELETE | `/api/nodes/config/:name` | Delete node by name |
+| POST | `/api/reload` | Reload configuration |
+
+**Request/Response Example:**
+
+```bash
+# Add node
+curl -X POST http://localhost:9090/api/nodes/config \
+  -H "Content-Type: application/json" \
+  -d '{"uri": "vless://uuid@server:443#NodeName"}'
+
+# Delete node
+curl -X DELETE http://localhost:9090/api/nodes/config/NodeName
+
+# Reload config
+curl -X POST http://localhost:9090/api/reload
+```
+
 ### Health Check Mechanism
 
 Auto health check on startup, then periodic checks:

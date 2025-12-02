@@ -273,6 +273,42 @@ hysteria2://password@server:port?sni=example.com&insecure=0&obfs=salamander&obfs
 - 解除节点拉黑
 - **一键导出节点**: 导出所有可用节点的代理池 URI（格式：`http://user:pass@host:port`）
 
+### 节点管理
+
+Web UI 提供**节点管理** Tab 页，支持节点的增删改查操作：
+
+- **添加节点**: 通过 URI 添加新节点（名称自动从 URI fragment 提取）
+- **编辑节点**: 修改现有节点配置
+- **删除节点**: 从配置中移除节点
+- **重载配置**: 重启 sing-box 内核使更改生效（⚠️ 会中断现有连接）
+
+Multi-Port 模式下，端口从 `base_port` 自动分配。
+
+**API 端点：**
+
+| 方法 | 端点 | 说明 |
+|------|------|------|
+| GET | `/api/nodes/config` | 获取所有配置节点 |
+| POST | `/api/nodes/config` | 添加新节点 |
+| PUT | `/api/nodes/config/:name` | 按名称更新节点 |
+| DELETE | `/api/nodes/config/:name` | 按名称删除节点 |
+| POST | `/api/reload` | 重载配置 |
+
+**请求示例：**
+
+```bash
+# 添加节点
+curl -X POST http://localhost:9090/api/nodes/config \
+  -H "Content-Type: application/json" \
+  -d '{"uri": "vless://uuid@server:443#节点名称"}'
+
+# 删除节点
+curl -X DELETE http://localhost:9090/api/nodes/config/节点名称
+
+# 重载配置
+curl -X POST http://localhost:9090/api/reload
+```
+
 ### 健康检查机制
 
 程序启动时会自动对所有节点进行健康检查，之后定期检查：
