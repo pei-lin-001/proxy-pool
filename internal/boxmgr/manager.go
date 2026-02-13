@@ -458,6 +458,8 @@ func (m *Manager) ensureMonitor(ctx context.Context) error {
 		// Set NodeManager for config CRUD endpoints
 		if m.monitorServer != nil {
 			m.monitorServer.SetNodeManager(m)
+			// Bind persistable config before serving requests so /api/settings is always populated.
+			m.monitorServer.SetConfig(m.cfg)
 		}
 		// Note: StartPeriodicHealthCheck is called after nodes are registered in Start()
 	}

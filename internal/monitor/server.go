@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"sort"
 	"strings"
 	"sync"
@@ -130,16 +131,52 @@ func (s *Server) SetConfig(cfg *config.Config) {
 		s.cfg.ExternalIP = cfg.ExternalIP
 		s.cfg.ProbeTarget = cfg.Management.ProbeTarget
 		s.cfg.SkipCertVerify = cfg.SkipCertVerify
+		s.cfg.Password = cfg.Management.Password
 	}
 }
 
 type settingsSnapshot struct {
+	Mode     string `json:"mode"`
+	LogLevel string `json:"log_level"`
+
+	ConnectTimeout string        `json:"connect_timeout"`
+	Listener       listenerView  `json:"listener"`
+	MultiPort      multiPortView `json:"multi_port"`
+	Pool           poolView      `json:"pool"`
+	Management     managementView `json:"management"`
+
 	ExternalIP          string                  `json:"external_ip"`
 	ProbeTarget         string                  `json:"probe_target"`
 	SkipCertVerify      bool                    `json:"skip_cert_verify"`
 	Subscriptions       []string                `json:"subscriptions"`
 	SubscriptionRefresh subscriptionRefreshView `json:"subscription_refresh"`
 	NodeFilter          config.NodeFilterConfig `json:"node_filter"`
+}
+
+type listenerView struct {
+	Address  string `json:"address"`
+	Port     uint16 `json:"port"`
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+type multiPortView struct {
+	Address  string `json:"address"`
+	BasePort uint16 `json:"base_port"`
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+type poolView struct {
+	Mode              string `json:"mode"`
+	FailureThreshold  int    `json:"failure_threshold"`
+	BlacklistDuration string `json:"blacklist_duration"`
+}
+
+type managementView struct {
+	Enabled     bool   `json:"enabled"`
+	Listen      string `json:"listen"`
+	PasswordSet bool   `json:"password_set"`
 }
 
 type subscriptionRefreshView struct {
@@ -156,6 +193,17 @@ func (s *Server) getSettingsSnapshot() settingsSnapshot {
 	defer s.cfgMu.RUnlock()
 
 	snap := settingsSnapshot{
+		Mode:           "",
+		LogLevel:       "",
+		ConnectTimeout: "",
+		Listener:       listenerView{},
+		MultiPort:      multiPortView{},
+		Pool:           poolView{},
+		Management: managementView{
+			Enabled:     s.cfg.Enabled,
+			Listen:      s.cfg.Listen,
+			PasswordSet: s.cfg.Password != "",
+		},
 		ExternalIP:     s.cfg.ExternalIP,
 		ProbeTarget:    s.cfg.ProbeTarget,
 		SkipCertVerify: s.cfg.SkipCertVerify,
@@ -164,9 +212,36 @@ func (s *Server) getSettingsSnapshot() settingsSnapshot {
 	if s.cfgSrc == nil {
 		return snap
 	}
+	snap.Mode = s.cfgSrc.Mode
 	snap.ExternalIP = s.cfgSrc.ExternalIP
 	snap.ProbeTarget = s.cfgSrc.Management.ProbeTarget
 	snap.SkipCertVerify = s.cfgSrc.SkipCertVerify
+	snap.LogLevel = s.cfgSrc.LogLevel
+	if s.cfgSrc.ConnectTimeout > 0 {
+		snap.ConnectTimeout = s.cfgSrc.ConnectTimeout.String()
+	}
+	snap.Listener = listenerView{
+		Address:  s.cfgSrc.Listener.Address,
+		Port:     s.cfgSrc.Listener.Port,
+		Username: s.cfgSrc.Listener.Username,
+		Password: s.cfgSrc.Listener.Password,
+	}
+	snap.MultiPort = multiPortView{
+		Address:  s.cfgSrc.MultiPort.Address,
+		BasePort: s.cfgSrc.MultiPort.BasePort,
+		Username: s.cfgSrc.MultiPort.Username,
+		Password: s.cfgSrc.MultiPort.Password,
+	}
+	snap.Pool = poolView{
+		Mode:              s.cfgSrc.Pool.Mode,
+		FailureThreshold:  s.cfgSrc.Pool.FailureThreshold,
+		BlacklistDuration: s.cfgSrc.Pool.BlacklistDuration.String(),
+	}
+	snap.Management = managementView{
+		Enabled:     s.cfgSrc.ManagementEnabled(),
+		Listen:      s.cfgSrc.Management.Listen,
+		PasswordSet: strings.TrimSpace(s.cfgSrc.Management.Password) != "",
+	}
 	snap.Subscriptions = make([]string, 0, len(s.cfgSrc.Subscriptions))
 	snap.Subscriptions = append(snap.Subscriptions, s.cfgSrc.Subscriptions...)
 	snap.NodeFilter = s.cfgSrc.NodeFilter
@@ -182,6 +257,36 @@ func (s *Server) getSettingsSnapshot() settingsSnapshot {
 }
 
 type settingsUpdate struct {
+	Mode           *string `json:"mode"`
+	LogLevel       *string `json:"log_level"`
+	ConnectTimeout *string `json:"connect_timeout"`
+
+	Listener *struct {
+		Address  *string `json:"address"`
+		Port     *uint16 `json:"port"`
+		Username *string `json:"username"`
+		Password *string `json:"password"`
+	} `json:"listener"`
+
+	MultiPort *struct {
+		Address  *string `json:"address"`
+		BasePort *uint16 `json:"base_port"`
+		Username *string `json:"username"`
+		Password *string `json:"password"`
+	} `json:"multi_port"`
+
+	Pool *struct {
+		Mode              *string `json:"mode"`
+		FailureThreshold  *int    `json:"failure_threshold"`
+		BlacklistDuration *string `json:"blacklist_duration"`
+	} `json:"pool"`
+
+	Management *struct {
+		Enabled  *bool   `json:"enabled"`
+		Listen   *string `json:"listen"`
+		Password *string `json:"password"`
+	} `json:"management"`
+
 	ExternalIP     *string `json:"external_ip"`
 	ProbeTarget    *string `json:"probe_target"`
 	SkipCertVerify *bool   `json:"skip_cert_verify"`
@@ -252,14 +357,222 @@ func (s *Server) updateSettings(update settingsUpdate) (needReload bool, err err
 	}
 
 	// Backup for rollback on save failure
+	prevMode := s.cfgSrc.Mode
+	prevLogLevel := s.cfgSrc.LogLevel
+	prevConnectTimeout := s.cfgSrc.ConnectTimeout
+	prevListener := s.cfgSrc.Listener
+	prevMultiPort := s.cfgSrc.MultiPort
+	prevPool := s.cfgSrc.Pool
+	prevMgmtEnabled := s.cfgSrc.Management.Enabled
+	prevMgmtListen := s.cfgSrc.Management.Listen
+	prevMgmtPassword := s.cfgSrc.Management.Password
+
 	prevExternalIP := s.cfgSrc.ExternalIP
 	prevProbeTarget := s.cfgSrc.Management.ProbeTarget
 	prevSkip := s.cfgSrc.SkipCertVerify
 	prevSubs := append([]string(nil), s.cfgSrc.Subscriptions...)
 	prevRefresh := s.cfgSrc.SubscriptionRefresh
 	prevFilter := s.cfgSrc.NodeFilter
+	prevFilter.Include = append([]string(nil), prevFilter.Include...)
+	prevFilter.Exclude = append([]string(nil), prevFilter.Exclude...)
 
 	// Apply updates
+	if update.Mode != nil {
+		next := strings.ToLower(strings.TrimSpace(*update.Mode))
+		if next == "" {
+			next = "pool"
+		}
+		if next == "multi_port" {
+			next = "multi-port"
+		}
+		switch next {
+		case "pool", "multi-port", "hybrid":
+		default:
+			return false, httpError{status: http.StatusBadRequest, message: "mode 只能是 pool / multi-port / hybrid"}
+		}
+		if next != prevMode {
+			needReload = true
+		}
+		s.cfgSrc.Mode = next
+	}
+
+	if update.LogLevel != nil {
+		next := strings.ToLower(strings.TrimSpace(*update.LogLevel))
+		if next == "" {
+			next = "info"
+		}
+		if next == "warning" {
+			next = "warn"
+		}
+		switch next {
+		case "trace", "debug", "info", "warn", "error", "fatal", "panic":
+		default:
+			return false, httpError{status: http.StatusBadRequest, message: "log_level 只能是 trace/debug/info/warn/error/fatal/panic"}
+		}
+		prevNorm := strings.ToLower(strings.TrimSpace(prevLogLevel))
+		if prevNorm == "" {
+			prevNorm = "info"
+		}
+		if next != prevNorm {
+			needReload = true
+		}
+		s.cfgSrc.LogLevel = next
+	}
+
+	if update.ConnectTimeout != nil {
+		raw := strings.TrimSpace(*update.ConnectTimeout)
+		if raw != "" {
+			d, parseErr := time.ParseDuration(raw)
+			if parseErr != nil {
+				return false, httpError{status: http.StatusBadRequest, message: fmt.Sprintf("无效 connect_timeout: %v", parseErr)}
+			}
+			if d != prevConnectTimeout {
+				needReload = true
+			}
+			s.cfgSrc.ConnectTimeout = d
+		}
+	}
+
+	if update.Listener != nil {
+		if update.Listener.Address != nil {
+			next := strings.TrimSpace(*update.Listener.Address)
+			if next != "" && net.ParseIP(next) == nil {
+				return false, httpError{status: http.StatusBadRequest, message: "listener.address 必须是 IP（例如 0.0.0.0 或 127.0.0.1）"}
+			}
+			if next != prevListener.Address {
+				needReload = true
+			}
+			s.cfgSrc.Listener.Address = next
+		}
+		if update.Listener.Port != nil {
+			next := *update.Listener.Port
+			if next == 0 {
+				return false, httpError{status: http.StatusBadRequest, message: "listener.port 必须在 1-65535"}
+			}
+			if next != prevListener.Port {
+				needReload = true
+			}
+			s.cfgSrc.Listener.Port = next
+		}
+		if update.Listener.Username != nil {
+			next := strings.TrimSpace(*update.Listener.Username)
+			if next != prevListener.Username {
+				needReload = true
+			}
+			s.cfgSrc.Listener.Username = next
+		}
+		if update.Listener.Password != nil {
+			next := *update.Listener.Password
+			if next != prevListener.Password {
+				needReload = true
+			}
+			s.cfgSrc.Listener.Password = next
+		}
+	}
+
+	if update.MultiPort != nil {
+		if update.MultiPort.Address != nil {
+			next := strings.TrimSpace(*update.MultiPort.Address)
+			if next != "" && net.ParseIP(next) == nil {
+				return false, httpError{status: http.StatusBadRequest, message: "multi_port.address 必须是 IP（例如 0.0.0.0 或 127.0.0.1）"}
+			}
+			if next != prevMultiPort.Address {
+				needReload = true
+			}
+			s.cfgSrc.MultiPort.Address = next
+		}
+		if update.MultiPort.BasePort != nil {
+			next := *update.MultiPort.BasePort
+			if next == 0 {
+				return false, httpError{status: http.StatusBadRequest, message: "multi_port.base_port 必须在 1-65535"}
+			}
+			if next != prevMultiPort.BasePort {
+				needReload = true
+			}
+			s.cfgSrc.MultiPort.BasePort = next
+		}
+		if update.MultiPort.Username != nil {
+			next := strings.TrimSpace(*update.MultiPort.Username)
+			if next != prevMultiPort.Username {
+				needReload = true
+			}
+			s.cfgSrc.MultiPort.Username = next
+		}
+		if update.MultiPort.Password != nil {
+			next := *update.MultiPort.Password
+			if next != prevMultiPort.Password {
+				needReload = true
+			}
+			s.cfgSrc.MultiPort.Password = next
+		}
+	}
+
+	if update.Pool != nil {
+		if update.Pool.Mode != nil {
+			next := strings.ToLower(strings.TrimSpace(*update.Pool.Mode))
+			if next == "" {
+				next = "sequential"
+			}
+			switch next {
+			case "sequential", "random", "balance":
+			default:
+				return false, httpError{status: http.StatusBadRequest, message: "pool.mode 只能是 sequential / random / balance"}
+			}
+			if next != strings.ToLower(strings.TrimSpace(prevPool.Mode)) {
+				needReload = true
+			}
+			s.cfgSrc.Pool.Mode = next
+		}
+		if update.Pool.FailureThreshold != nil {
+			next := *update.Pool.FailureThreshold
+			if next <= 0 {
+				return false, httpError{status: http.StatusBadRequest, message: "pool.failure_threshold 必须大于 0"}
+			}
+			if next != prevPool.FailureThreshold {
+				needReload = true
+			}
+			s.cfgSrc.Pool.FailureThreshold = next
+		}
+		if update.Pool.BlacklistDuration != nil {
+			raw := strings.TrimSpace(*update.Pool.BlacklistDuration)
+			if raw != "" {
+				d, parseErr := time.ParseDuration(raw)
+				if parseErr != nil {
+					return false, httpError{status: http.StatusBadRequest, message: fmt.Sprintf("无效 pool.blacklist_duration: %v", parseErr)}
+				}
+				if d != prevPool.BlacklistDuration {
+					needReload = true
+				}
+				s.cfgSrc.Pool.BlacklistDuration = d
+			}
+		}
+	}
+
+	if update.Management != nil {
+		if update.Management.Enabled != nil {
+			next := *update.Management.Enabled
+			if prevMgmtEnabled == nil || next != *prevMgmtEnabled {
+				// WebUI enable/disable does not require sing-box reload.
+			}
+			s.cfgSrc.Management.Enabled = &next
+		}
+		if update.Management.Listen != nil {
+			next := strings.TrimSpace(*update.Management.Listen)
+			if next != prevMgmtListen {
+				// Changing management.listen requires restarting the monitor server to take effect.
+			}
+			s.cfgSrc.Management.Listen = next
+		}
+		if update.Management.Password != nil {
+			next := *update.Management.Password
+			if next != prevMgmtPassword {
+				// No reload needed; affects auth only.
+			}
+			s.cfgSrc.Management.Password = next
+			s.cfg.Password = next
+		}
+	}
+
 	if update.ExternalIP != nil {
 		s.cfgSrc.ExternalIP = strings.TrimSpace(*update.ExternalIP)
 		s.cfg.ExternalIP = s.cfgSrc.ExternalIP
@@ -383,6 +696,16 @@ func (s *Server) updateSettings(update settingsUpdate) (needReload bool, err err
 	// Persist changes
 	if saveErr := s.cfgSrc.SaveSettings(); saveErr != nil {
 		// Rollback
+		s.cfgSrc.Mode = prevMode
+		s.cfgSrc.LogLevel = prevLogLevel
+		s.cfgSrc.ConnectTimeout = prevConnectTimeout
+		s.cfgSrc.Listener = prevListener
+		s.cfgSrc.MultiPort = prevMultiPort
+		s.cfgSrc.Pool = prevPool
+		s.cfgSrc.Management.Enabled = prevMgmtEnabled
+		s.cfgSrc.Management.Listen = prevMgmtListen
+		s.cfgSrc.Management.Password = prevMgmtPassword
+
 		s.cfgSrc.ExternalIP = prevExternalIP
 		s.cfgSrc.Management.ProbeTarget = prevProbeTarget
 		s.cfgSrc.SkipCertVerify = prevSkip
@@ -390,6 +713,7 @@ func (s *Server) updateSettings(update settingsUpdate) (needReload bool, err err
 		s.cfgSrc.SubscriptionRefresh = prevRefresh
 		s.cfgSrc.NodeFilter = prevFilter
 
+		s.cfg.Password = prevMgmtPassword
 		s.cfg.ExternalIP = prevExternalIP
 		s.cfg.ProbeTarget = prevProbeTarget
 		s.cfg.SkipCertVerify = prevSkip
@@ -743,6 +1067,17 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 
 	settings := s.getSettingsSnapshot()
 	requestHost := extractHost(r)
+
+	authUser := ""
+	authPass := ""
+	if settings.Mode == "multi-port" || settings.Mode == "hybrid" {
+		authUser = settings.MultiPort.Username
+		authPass = settings.MultiPort.Password
+	} else {
+		authUser = settings.Listener.Username
+		authPass = settings.Listener.Password
+	}
+
 	for _, snap := range snapshots {
 		// 只导出有监听地址和端口的节点
 		if snap.ListenAddress == "" || snap.Port == 0 {
@@ -762,15 +1097,14 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		var proxyURI string
-		if s.cfg.ProxyUsername != "" && s.cfg.ProxyPassword != "" {
-			proxyURI = fmt.Sprintf("http://%s:%s@%s:%d",
-				s.cfg.ProxyUsername, s.cfg.ProxyPassword,
-				listenAddr, snap.Port)
-		} else {
-			proxyURI = fmt.Sprintf("http://%s:%d", listenAddr, snap.Port)
+		proxyURL := &url.URL{
+			Scheme: "http",
+			Host:   net.JoinHostPort(listenAddr, strconv.Itoa(int(snap.Port))),
 		}
-		lines = append(lines, proxyURI)
+		if strings.TrimSpace(authUser) != "" {
+			proxyURL.User = url.UserPassword(authUser, authPass)
+		}
+		lines = append(lines, proxyURL.String())
 	}
 
 	// 返回纯文本，每行一个 URI

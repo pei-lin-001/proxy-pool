@@ -595,6 +595,20 @@
       margin-top: 4px;
     }
 
+    .form-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      align-items: start;
+    }
+
+    .details-body {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      margin-top: 12px;
+    }
+
     /* Geo quick filter */
     .geo-quick-bar {
       display: flex;
@@ -732,6 +746,88 @@
       color: var(--text-primary);
       font-weight: 600;
       margin-bottom: 8px;
+    }
+
+    /* Proxy links */
+    .proxy-links {
+      background: var(--bg-elevated);
+      backdrop-filter: saturate(180%) blur(20px);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 20px 24px;
+      margin: -20px 0 28px;
+      box-shadow: var(--shadow-sm);
+    }
+
+    .proxy-links-header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
+      flex-wrap: wrap;
+    }
+
+    .proxy-links-title {
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--text-primary);
+    }
+
+    .proxy-links-sub {
+      font-size: 12px;
+      color: var(--text-secondary);
+      margin-top: 4px;
+    }
+
+    .proxy-links-actions {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .proxy-links-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .proxy-link-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.75);
+    }
+
+    .proxy-link-label {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text-secondary);
+      min-width: 110px;
+      white-space: nowrap;
+    }
+
+    .proxy-link-url {
+      flex: 1;
+      min-width: 0;
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--text-primary);
+      font-family: "SF Mono", Menlo, Monaco, monospace;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .proxy-link-hint {
+      font-size: 12px;
+      color: var(--text-secondary);
+      margin-top: 8px;
     }
 
     .login-error {
@@ -1030,6 +1126,7 @@
       .controls { flex-direction: column; }
       .btn { width: 100%; justify-content: center; }
       .login-modal { padding: 32px 24px; }
+      .form-row { grid-template-columns: 1fr; }
       .tabs { flex-direction: column; }
       .tab { width: 100%; }
       .manage-actions { flex-direction: column; }
@@ -1117,6 +1214,31 @@
       </div>
     </div>
 
+    <div id="proxyLinksCard" class="proxy-links" style="display: none;">
+      <div class="proxy-links-header">
+        <div>
+          <div class="proxy-links-title">🔗 代理地址（用于其它项目）</div>
+          <div id="proxyLinksHint" class="proxy-links-sub">加载中...</div>
+        </div>
+        <div class="proxy-links-actions">
+          <label class="geo-quick-single" title="开启后将显示包含用户名/密码的完整 URL">
+            <input type="checkbox" id="proxyShowSecrets" onchange="renderProxyLinks()" />
+            显示密码
+          </label>
+          <button class="btn btn-secondary btn-sm" onclick="copyAllProxyLinks()">复制全部</button>
+          <button class="btn btn-secondary btn-sm" onclick="exportNodes()">下载</button>
+        </div>
+      </div>
+      <div id="proxyLinksList" class="proxy-links-list"></div>
+      <details id="proxyNodeLinksDetails" class="sub-advanced" style="display: none;">
+        <summary id="proxyNodeLinksSummary">节点入口</summary>
+        <div class="details-body">
+          <div id="proxyNodeLinksList" class="proxy-links-list"></div>
+          <div class="proxy-link-hint">提示：节点入口仅在 multi-port/hybrid 模式下可用；修改模式/端口后需重载配置生效</div>
+        </div>
+      </details>
+    </div>
+
     <div id="nodesContainer" class="nodes-grid"></div>
 
     <div id="emptyState" class="empty" style="display: none;">
@@ -1125,7 +1247,7 @@
         <path d="M32 16v32M16 32h32" stroke="currentColor" stroke-width="4" stroke-linecap="round"/>
       </svg>
       <h3>暂无代理节点</h3>
-      <p>请在配置文件中添加代理节点</p>
+      <p>请在「节点管理」或「订阅」中添加代理节点</p>
     </div>
     </div><!-- end monitorTab -->
 
@@ -1283,6 +1405,152 @@
         </div>
         <p class="form-help" style="margin-top: -8px;">启用后所有节点将忽略 SSL 证书错误，修改后需重载生效</p>
 
+        <details class="sub-advanced" open>
+          <summary>代理服务（模式/端口/账号）</summary>
+          <div class="details-body">
+            <div class="form-group">
+              <label class="form-label" for="settingMode">运行模式</label>
+              <select id="settingMode" class="form-input" onchange="applyModeVisibility()">
+                <option value="pool">pool（单端口代理池）</option>
+                <option value="multi-port">multi-port（每节点独立端口）</option>
+                <option value="hybrid">hybrid（混合：pool + multi-port）</option>
+              </select>
+              <p class="form-help">切换模式/端口/认证信息后，需要重载配置生效</p>
+            </div>
+
+            <div id="listenerSettings">
+              <div class="form-row">
+                <div class="form-group">
+                  <label class="form-label" for="settingListenerAddress">Pool 监听地址</label>
+                  <input type="text" id="settingListenerAddress" class="form-input" placeholder="0.0.0.0" />
+                  <p class="form-help">必须是 IP（不支持 localhost）</p>
+                </div>
+                <div class="form-group">
+                  <label class="form-label" for="settingListenerPort">Pool 监听端口</label>
+                  <input type="number" id="settingListenerPort" class="form-input" min="1" max="65535" placeholder="2323" />
+                </div>
+              </div>
+              <div class="form-row">
+                <div class="form-group">
+                  <label class="form-label" for="settingListenerUsername">Pool 用户名（可选）</label>
+                  <input type="text" id="settingListenerUsername" class="form-input" placeholder="留空表示不需要认证" />
+                </div>
+                <div class="form-group">
+                  <label class="form-label" for="settingListenerPassword">Pool 密码</label>
+                  <input type="password" id="settingListenerPassword" class="form-input" placeholder="与用户名配套" />
+                </div>
+              </div>
+              <p class="form-help">pool / hybrid 模式下有效（hybrid 的 pool 入口使用这组账号密码）</p>
+            </div>
+
+            <div id="multiPortSettings">
+              <div class="form-row">
+                <div class="form-group">
+                  <label class="form-label" for="settingMultiPortAddress">Multi-port 监听地址</label>
+                  <input type="text" id="settingMultiPortAddress" class="form-input" placeholder="0.0.0.0" />
+                  <p class="form-help">必须是 IP（不支持 localhost）</p>
+                </div>
+                <div class="form-group">
+                  <label class="form-label" for="settingMultiPortBasePort">Multi-port 起始端口</label>
+                  <input type="number" id="settingMultiPortBasePort" class="form-input" min="1" max="65535" placeholder="24000" />
+                </div>
+              </div>
+              <div class="form-row">
+                <div class="form-group">
+                  <label class="form-label" for="settingMultiPortUsername">Multi-port 用户名（可选）</label>
+                  <input type="text" id="settingMultiPortUsername" class="form-input" placeholder="留空表示不需要认证" />
+                </div>
+                <div class="form-group">
+                  <label class="form-label" for="settingMultiPortPassword">Multi-port 密码</label>
+                  <input type="password" id="settingMultiPortPassword" class="form-input" placeholder="与用户名配套" />
+                </div>
+              </div>
+              <p class="form-help">multi-port / hybrid 模式下有效（hybrid 导出的节点入口使用这组账号密码）</p>
+            </div>
+          </div>
+        </details>
+
+        <details class="sub-advanced">
+          <summary>代理策略与运行参数</summary>
+          <div class="details-body">
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label" for="settingLogLevel">日志级别</label>
+                <select id="settingLogLevel" class="form-input">
+                  <option value="trace">trace</option>
+                  <option value="debug">debug</option>
+                  <option value="info">info</option>
+                  <option value="warn">warn</option>
+                  <option value="error">error</option>
+                  <option value="fatal">fatal</option>
+                  <option value="panic">panic</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label" for="settingConnectTimeout">连接超时</label>
+                <input type="text" id="settingConnectTimeout" class="form-input" placeholder="例如：15s / 30s" />
+                <p class="form-help">Go duration；用于节点出站连接，避免长时间卡住（修改后需重载生效）</p>
+              </div>
+            </div>
+
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label" for="settingPoolMode">Pool 调度策略</label>
+                <select id="settingPoolMode" class="form-input">
+                  <option value="sequential">sequential（轮询）</option>
+                  <option value="random">random（随机）</option>
+                  <option value="balance">balance（负载均衡）</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label class="form-label" for="settingPoolFailureThreshold">失败阈值</label>
+                <input type="number" id="settingPoolFailureThreshold" class="form-input" min="1" step="1" placeholder="3" />
+                <p class="form-help">连续失败达到阈值将被拉黑</p>
+              </div>
+            </div>
+
+            <div class="form-group">
+              <label class="form-label" for="settingPoolBlacklistDuration">拉黑时长</label>
+              <input type="text" id="settingPoolBlacklistDuration" class="form-input" placeholder="例如：24h / 6h" />
+              <p class="form-help">Go duration；修改后需重载生效</p>
+            </div>
+          </div>
+        </details>
+
+        <details class="sub-advanced">
+          <summary>WebUI（监听/密码）</summary>
+          <div class="details-body">
+            <div class="form-group" style="display: flex; align-items: center; gap: 12px;">
+              <label class="form-label" for="settingMgmtEnabled" style="margin: 0; flex: 1;">启用 WebUI</label>
+              <label class="toggle-switch">
+                <input type="checkbox" id="settingMgmtEnabled" />
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+            <p class="form-help" style="margin-top: -8px;">关闭后 WebUI 将在下次重启时不再启动（建议谨慎）</p>
+
+            <div class="form-group">
+              <label class="form-label" for="settingMgmtListen">WebUI 监听地址</label>
+              <input type="text" id="settingMgmtListen" class="form-input" placeholder="0.0.0.0:9090" />
+              <p class="form-help">修改后需要重启服务/容器才能生效</p>
+            </div>
+
+            <div class="form-group" style="display: flex; align-items: center; gap: 12px;">
+              <label class="form-label" for="settingMgmtPasswordEnabled" style="margin: 0; flex: 1;">启用 WebUI 密码</label>
+              <label class="toggle-switch">
+                <input type="checkbox" id="settingMgmtPasswordEnabled" onchange="toggleMgmtPasswordRow()" />
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+
+            <div class="form-group" id="mgmtPasswordRow" style="display: none;">
+              <label class="form-label" for="settingMgmtPassword">设置新密码</label>
+              <input type="password" id="settingMgmtPassword" class="form-input" placeholder="留空表示不修改（如果之前已设置）" />
+              <p class="form-help">保存后可能需要重新登录</p>
+            </div>
+          </div>
+        </details>
+
         <div style="height: 1px; background: rgba(0,0,0,0.06); margin: 18px 0;"></div>
 
         <div class="form-group">
@@ -1308,8 +1576,37 @@
         <div class="form-group">
           <label class="form-label" for="settingSubRefreshInterval">刷新间隔</label>
           <input type="text" id="settingSubRefreshInterval" class="form-input" placeholder="例如：1h / 30m / 6h" />
-          <p class="form-help">Go duration 格式；留空则保持现有配置</p>
+          <p class="form-help">Go duration 格式；留空表示不修改</p>
         </div>
+
+        <details class="sub-advanced">
+          <summary>高级：订阅刷新参数</summary>
+          <div class="details-body">
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label" for="settingSubRefreshTimeout">请求超时</label>
+                <input type="text" id="settingSubRefreshTimeout" class="form-input" placeholder="例如：30s" />
+              </div>
+              <div class="form-group">
+                <label class="form-label" for="settingSubRefreshHealthCheckTimeout">健康检查超时</label>
+                <input type="text" id="settingSubRefreshHealthCheckTimeout" class="form-input" placeholder="例如：60s" />
+              </div>
+            </div>
+
+            <div class="form-row">
+              <div class="form-group">
+                <label class="form-label" for="settingSubRefreshDrainTimeout">排空超时</label>
+                <input type="text" id="settingSubRefreshDrainTimeout" class="form-input" placeholder="例如：30s" />
+                <p class="form-help">切换配置时等待旧实例排空连接的时间</p>
+              </div>
+              <div class="form-group">
+                <label class="form-label" for="settingSubRefreshMinAvailableNodes">最少可用节点</label>
+                <input type="number" id="settingSubRefreshMinAvailableNodes" class="form-input" min="1" step="1" placeholder="1" />
+                <p class="form-help">低于此值时刷新不会切换到新配置</p>
+              </div>
+            </div>
+          </div>
+        </details>
 
         <div style="height: 1px; background: rgba(0,0,0,0.06); margin: 18px 0;"></div>
 
@@ -1397,6 +1694,7 @@
     let autoRefreshInterval = null;
     let isAutoRefresh = true;
     let isAuthenticated = false;
+    let settingsCache = null;
 
     // 检查是否需要登录
     async function checkAuth() {
@@ -1531,8 +1829,10 @@
         }
         if (!res.ok) throw new Error('请求失败');
         const data = await res.json();
-        render(data.nodes || []);
-        updateStats(data.nodes || []);
+        latestNodes = data.nodes || [];
+        render(latestNodes);
+        updateStats(latestNodes);
+        renderProxyLinks();
         document.getElementById('lastUpdate').textContent = `更新于 ${new Date().toLocaleTimeString('zh-CN')}`;
       } catch (err) {
         showToast('刷新失败: ' + err.message, 'error');
@@ -1993,11 +2293,236 @@
 
     // ========== 系统设置功能 ==========
 
+    let latestNodes = [];
+    let proxyLinksComputed = { base: [], nodes: [] };
+
+    function normalizeHostInput(value) {
+      let v = String(value || '').trim();
+      if (!v) return '';
+      v = v.replace(/^https?:\/\//i, '');
+      v = v.split('/')[0];
+      // If user inputs "[::1]:9090", extract "::1".
+      if (v.startsWith('[')) {
+        const end = v.indexOf(']');
+        if (end > 0) return v.slice(1, end);
+      }
+      const colonCount = (v.match(/:/g) || []).length;
+      if (colonCount === 1) {
+        const parts = v.split(':');
+        const host = parts[0];
+        const maybePort = parts[1];
+        if (host && maybePort && /^[0-9]+$/.test(maybePort)) return host;
+      }
+      return v;
+    }
+
+    async function loadSettingsCache() {
+      try {
+        const res = await fetch('/api/settings');
+        if (!res.ok) return null;
+        settingsCache = await res.json();
+        return settingsCache;
+      } catch (e) {
+        return null;
+      }
+    }
+
+    function formatHostForUrl(host) {
+      const h = String(host || '').trim();
+      if (!h) return '';
+      if (h.startsWith('[') && h.endsWith(']')) return h;
+      const colonCount = (h.match(/:/g) || []).length;
+      if (colonCount >= 2) return `[${h}]`; // likely IPv6 literal
+      return h;
+    }
+
+    function buildProxyUrl(host, port, username, password) {
+      const hostForUrl = formatHostForUrl(host);
+      const u = new URL(`http://${hostForUrl}:${port}`);
+      const user = String(username || '').trim();
+      if (user) {
+        u.username = user;
+        u.password = String(password || '');
+      }
+      return u.toString();
+    }
+
+    function maskUrlIfNeeded(fullUrl) {
+      const showSecrets = !!document.getElementById('proxyShowSecrets')?.checked;
+      if (showSecrets) return fullUrl;
+      try {
+        const u = new URL(fullUrl);
+        if (!u.username) return fullUrl;
+        if (u.password) u.password = '******';
+        return u.toString();
+      } catch (e) {
+        return fullUrl;
+      }
+    }
+
+    function copyText(text) {
+      const value = String(text || '');
+      if (!value) return;
+      if (navigator?.clipboard?.writeText && window.isSecureContext) {
+        navigator.clipboard.writeText(value).then(() => {
+          showToast('已复制到剪贴板', 'success');
+        }).catch(() => {
+          copyTextLegacy(value);
+        });
+        return;
+      }
+      copyTextLegacy(value);
+    }
+
+    function copyTextLegacy(value) {
+      const ta = document.createElement('textarea');
+      ta.value = value;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      try {
+        document.execCommand('copy');
+        showToast('已复制到剪贴板', 'success');
+      } catch (e) {
+        showToast('复制失败，请手动复制', 'error');
+      } finally {
+        document.body.removeChild(ta);
+      }
+    }
+
+    function computeProxyLinks(nodes) {
+      const cfg = settingsCache || {};
+      const mode = cfg.mode || 'pool';
+      const host = normalizeHostInput(cfg.external_ip) || window.location.hostname;
+
+      const links = { base: [], nodes: [] };
+
+      if (mode === 'pool' || mode === 'hybrid') {
+        const port = (cfg.listener && cfg.listener.port) ? cfg.listener.port : 2323;
+        const user = cfg.listener ? cfg.listener.username : '';
+        const pass = cfg.listener ? cfg.listener.password : '';
+        links.base.push({
+          label: mode === 'hybrid' ? 'Pool 入口（hybrid）' : 'Pool 入口',
+          url: buildProxyUrl(host, port, user, pass),
+        });
+      }
+
+      if (mode === 'multi-port' || mode === 'hybrid') {
+        const user = cfg.multi_port ? cfg.multi_port.username : '';
+        const pass = cfg.multi_port ? cfg.multi_port.password : '';
+        const list = (nodes || []).filter(n => n && n.port);
+        // Prefer healthy nodes first
+        list.sort((a, b) => {
+          const sa = getNodeStatus(a);
+          const sb = getNodeStatus(b);
+          const rank = { healthy: 0, warning: 1, error: 2, blacklisted: 3 };
+          return (rank[sa] ?? 9) - (rank[sb] ?? 9);
+        });
+        for (const n of list) {
+          links.nodes.push({
+            label: (n.name || n.tag || 'node') + (n.tag ? ` (${n.tag})` : ''),
+            url: buildProxyUrl(host, n.port, user, pass),
+            status: getNodeStatus(n),
+          });
+        }
+        // Show a few examples in the base list for visibility
+        for (const item of links.nodes.slice(0, 3)) {
+          links.base.push({ label: `节点：${item.label}`, url: item.url });
+        }
+      }
+
+      return { mode, host, links };
+    }
+
+    function renderProxyLinks() {
+      const card = document.getElementById('proxyLinksCard');
+      const hintEl = document.getElementById('proxyLinksHint');
+      const listEl = document.getElementById('proxyLinksList');
+      const detailsEl = document.getElementById('proxyNodeLinksDetails');
+      const summaryEl = document.getElementById('proxyNodeLinksSummary');
+      const nodeListEl = document.getElementById('proxyNodeLinksList');
+
+      if (!card || !hintEl || !listEl || !detailsEl || !summaryEl || !nodeListEl) return;
+      if (!settingsCache) {
+        card.style.display = 'none';
+        return;
+      }
+
+      const computed = computeProxyLinks(latestNodes);
+      proxyLinksComputed = computed.links;
+
+      card.style.display = 'block';
+      const hostShown = computed.host || '';
+      hintEl.textContent = `当前显示使用主机：${hostShown || '—'}（如在其它机器使用，请在设置中填写 external_ip）`;
+
+      const baseHtml = (proxyLinksComputed.base || []).map(item => {
+        const full = item.url;
+        const display = maskUrlIfNeeded(full);
+        return `
+          <div class="proxy-link-item">
+            <div class="proxy-link-label">${escapeHtml(item.label || '代理')}</div>
+            <div class="proxy-link-url" title="${escapeHtml(display)}" data-full="${escapeHtml(full)}">${escapeHtml(display)}</div>
+            <button class="btn btn-secondary btn-sm" type="button" onclick="copyText('${escapeJs(full)}')">复制</button>
+          </div>
+        `;
+      }).join('');
+
+      listEl.innerHTML = baseHtml || `<div class="form-help">暂无可用的代理入口（请先在设置中配置模式/端口，并添加节点后重载）</div>`;
+
+      // Node links (multi-port / hybrid)
+      const showNodes = computed.mode === 'multi-port' || computed.mode === 'hybrid';
+      detailsEl.style.display = showNodes ? 'block' : 'none';
+      if (showNodes) {
+        summaryEl.textContent = `节点入口（${(proxyLinksComputed.nodes || []).length}）`;
+        if (detailsEl.open) {
+          nodeListEl.innerHTML = (proxyLinksComputed.nodes || []).map(item => {
+            const full = item.url;
+            const display = maskUrlIfNeeded(full);
+            const badge = item.status ? ` · ${getStatusText(item.status)}` : '';
+            return `
+              <div class="proxy-link-item">
+                <div class="proxy-link-label">${escapeHtml(item.label || '节点')}${escapeHtml(badge)}</div>
+                <div class="proxy-link-url" title="${escapeHtml(display)}">${escapeHtml(display)}</div>
+                <button class="btn btn-secondary btn-sm" type="button" onclick="copyText('${escapeJs(full)}')">复制</button>
+              </div>
+            `;
+          }).join('') || `<div class="form-help">暂无节点入口（请添加节点并重载）</div>`;
+        } else {
+          // Avoid rendering huge lists unless user expands.
+          nodeListEl.innerHTML = `<div class="form-help">展开后显示全部节点入口</div>`;
+        }
+      }
+    }
+
+    function copyAllProxyLinks() {
+      const base = (proxyLinksComputed.base || []).map(x => x.url).filter(Boolean);
+      const nodes = (proxyLinksComputed.nodes || []).map(x => x.url).filter(Boolean);
+      const all = base.concat(nodes);
+      if (all.length === 0) {
+        showToast('暂无可复制的代理地址', 'error');
+        return;
+      }
+      if (all.length > 80 && !confirm(`将复制 ${all.length} 行代理地址，确定继续吗？`)) {
+        return;
+      }
+      copyText(all.join('\n'));
+    }
+
     function parseListText(text) {
       return (text || '')
         .split(/[\n,]+/)
         .map(s => s.trim())
         .filter(Boolean);
+    }
+
+    function escapeJs(s) {
+      return String(s || '')
+        .replace(/\\/g, '\\\\')
+        .replace(/'/g, "\\'")
+        .replace(/\n/g, '\\n')
+        .replace(/\r/g, '');
     }
 
     function parseSubscriptionsText(text) {
@@ -2018,6 +2543,39 @@
         out.push(v);
       }
       return out;
+    }
+
+    function readIntValue(id) {
+      const el = document.getElementById(id);
+      if (!el) return null;
+      const raw = String(el.value ?? '').trim();
+      if (!raw) return null;
+      const n = parseInt(raw, 10);
+      if (!Number.isFinite(n)) return null;
+      return n;
+    }
+
+    function applyModeVisibility() {
+      const modeEl = document.getElementById('settingMode');
+      const mode = (modeEl && modeEl.value) ? modeEl.value : 'pool';
+      const showListener = mode === 'pool' || mode === 'hybrid';
+      const showMulti = mode === 'multi-port' || mode === 'hybrid';
+      const listener = document.getElementById('listenerSettings');
+      const multi = document.getElementById('multiPortSettings');
+      if (listener) listener.style.display = showListener ? 'block' : 'none';
+      if (multi) multi.style.display = showMulti ? 'block' : 'none';
+    }
+
+    function toggleMgmtPasswordRow() {
+      const enabledEl = document.getElementById('settingMgmtPasswordEnabled');
+      const row = document.getElementById('mgmtPasswordRow');
+      if (!row) return;
+      const enabled = enabledEl ? !!enabledEl.checked : false;
+      row.style.display = enabled ? 'flex' : 'none';
+      if (!enabled) {
+        const pwd = document.getElementById('settingMgmtPassword');
+        if (pwd) pwd.value = '';
+      }
     }
 
     function getSubscriptionsFromTextarea() {
@@ -2271,8 +2829,33 @@
       fetch('/api/settings')
         .then(res => res.ok ? res.json() : {})
         .then(data => {
+          settingsCache = data || {};
           initGeoQuickUI();
           initSubscriptionUI();
+          document.getElementById('settingMode').value = data.mode || 'pool';
+          document.getElementById('settingLogLevel').value = data.log_level || 'info';
+          document.getElementById('settingConnectTimeout').value = data.connect_timeout || '';
+
+          document.getElementById('settingListenerAddress').value = (data.listener && data.listener.address) ? data.listener.address : '';
+          document.getElementById('settingListenerPort').value = (data.listener && data.listener.port) ? data.listener.port : '';
+          document.getElementById('settingListenerUsername').value = (data.listener && data.listener.username) ? data.listener.username : '';
+          document.getElementById('settingListenerPassword').value = (data.listener && data.listener.password) ? data.listener.password : '';
+
+          document.getElementById('settingMultiPortAddress').value = (data.multi_port && data.multi_port.address) ? data.multi_port.address : '';
+          document.getElementById('settingMultiPortBasePort').value = (data.multi_port && data.multi_port.base_port) ? data.multi_port.base_port : '';
+          document.getElementById('settingMultiPortUsername').value = (data.multi_port && data.multi_port.username) ? data.multi_port.username : '';
+          document.getElementById('settingMultiPortPassword').value = (data.multi_port && data.multi_port.password) ? data.multi_port.password : '';
+
+          document.getElementById('settingPoolMode').value = (data.pool && data.pool.mode) ? data.pool.mode : 'sequential';
+          document.getElementById('settingPoolFailureThreshold').value = (data.pool && data.pool.failure_threshold) ? data.pool.failure_threshold : '';
+          document.getElementById('settingPoolBlacklistDuration').value = (data.pool && data.pool.blacklist_duration) ? data.pool.blacklist_duration : '';
+
+          document.getElementById('settingMgmtEnabled').checked = (data.management && typeof data.management.enabled === 'boolean') ? data.management.enabled : true;
+          document.getElementById('settingMgmtListen').value = (data.management && data.management.listen) ? data.management.listen : '';
+          document.getElementById('settingMgmtPasswordEnabled').checked = (data.management && data.management.password_set) ? true : false;
+          document.getElementById('settingMgmtPassword').value = '';
+          toggleMgmtPasswordRow();
+
           document.getElementById('settingExternalIP').value = data.external_ip || '';
           document.getElementById('settingProbeTarget').value = data.probe_target || '';
           document.getElementById('settingSkipCertVerify').checked = data.skip_cert_verify || false;
@@ -2280,10 +2863,15 @@
           renderSubscriptionList();
           document.getElementById('settingSubRefreshEnabled').checked = (data.subscription_refresh && data.subscription_refresh.enabled) || false;
           document.getElementById('settingSubRefreshInterval').value = (data.subscription_refresh && data.subscription_refresh.interval) ? data.subscription_refresh.interval : '';
+          document.getElementById('settingSubRefreshTimeout').value = (data.subscription_refresh && data.subscription_refresh.timeout) ? data.subscription_refresh.timeout : '';
+          document.getElementById('settingSubRefreshHealthCheckTimeout').value = (data.subscription_refresh && data.subscription_refresh.health_check_timeout) ? data.subscription_refresh.health_check_timeout : '';
+          document.getElementById('settingSubRefreshDrainTimeout').value = (data.subscription_refresh && data.subscription_refresh.drain_timeout) ? data.subscription_refresh.drain_timeout : '';
+          document.getElementById('settingSubRefreshMinAvailableNodes').value = (data.subscription_refresh && data.subscription_refresh.min_available_nodes) ? data.subscription_refresh.min_available_nodes : '';
           document.getElementById('settingNodeFilterTarget').value = (data.node_filter && data.node_filter.target) ? data.node_filter.target : 'name';
           document.getElementById('settingNodeFilterInclude').value = (data.node_filter && data.node_filter.include) ? data.node_filter.include.join(', ') : '';
           document.getElementById('settingNodeFilterExclude').value = (data.node_filter && data.node_filter.exclude) ? data.node_filter.exclude.join(', ') : '';
           document.getElementById('settingNodeFilterUseRegex').checked = (data.node_filter && data.node_filter.use_regex) || false;
+          applyModeVisibility();
           if (geoOptionsCache) {
             renderGeoOptions();
             applyIncludeToGeoSelection();
@@ -2312,7 +2900,48 @@
       const errorEl = document.getElementById('settingsError');
       errorEl.classList.remove('show');
 
+      const listenerPort = readIntValue('settingListenerPort');
+      const multiBasePort = readIntValue('settingMultiPortBasePort');
+      const poolFailureThreshold = readIntValue('settingPoolFailureThreshold');
+      const minAvailableNodes = readIntValue('settingSubRefreshMinAvailableNodes');
+
+      const management = {
+        enabled: document.getElementById('settingMgmtEnabled').checked,
+        listen: document.getElementById('settingMgmtListen').value.trim()
+      };
+      const mgmtPwdEnabled = document.getElementById('settingMgmtPasswordEnabled').checked;
+      const mgmtPwd = document.getElementById('settingMgmtPassword').value || '';
+      if (!mgmtPwdEnabled) {
+        management.password = "";
+      } else {
+        if (mgmtPwd.trim()) {
+          management.password = mgmtPwd;
+        } else if (!settingsCache?.management?.password_set) {
+          errorEl.textContent = '请设置 WebUI 密码';
+          errorEl.classList.add('show');
+          return;
+        }
+      }
+
       const payload = {
+        mode: document.getElementById('settingMode').value,
+        log_level: document.getElementById('settingLogLevel').value,
+        connect_timeout: document.getElementById('settingConnectTimeout').value.trim(),
+        listener: {
+          address: document.getElementById('settingListenerAddress').value.trim(),
+          username: document.getElementById('settingListenerUsername').value.trim(),
+          password: document.getElementById('settingListenerPassword').value
+        },
+        multi_port: {
+          address: document.getElementById('settingMultiPortAddress').value.trim(),
+          username: document.getElementById('settingMultiPortUsername').value.trim(),
+          password: document.getElementById('settingMultiPortPassword').value
+        },
+        pool: {
+          mode: document.getElementById('settingPoolMode').value,
+          blacklist_duration: document.getElementById('settingPoolBlacklistDuration').value.trim()
+        },
+        management,
         external_ip: document.getElementById('settingExternalIP').value.trim(),
         probe_target: document.getElementById('settingProbeTarget').value.trim(),
         skip_cert_verify: document.getElementById('settingSkipCertVerify').checked,
@@ -2322,8 +2951,15 @@
           .filter(Boolean),
         subscription_refresh: (() => {
           const interval = document.getElementById('settingSubRefreshInterval').value.trim();
+          const timeout = document.getElementById('settingSubRefreshTimeout').value.trim();
+          const healthCheckTimeout = document.getElementById('settingSubRefreshHealthCheckTimeout').value.trim();
+          const drainTimeout = document.getElementById('settingSubRefreshDrainTimeout').value.trim();
           const obj = { enabled: document.getElementById('settingSubRefreshEnabled').checked };
           if (interval) obj.interval = interval;
+          if (timeout) obj.timeout = timeout;
+          if (healthCheckTimeout) obj.health_check_timeout = healthCheckTimeout;
+          if (drainTimeout) obj.drain_timeout = drainTimeout;
+          if (minAvailableNodes !== null) obj.min_available_nodes = minAvailableNodes;
           return obj;
         })(),
         node_filter: {
@@ -2334,6 +2970,10 @@
         }
       };
 
+      if (listenerPort !== null) payload.listener.port = listenerPort;
+      if (multiBasePort !== null) payload.multi_port.base_port = multiBasePort;
+      if (poolFailureThreshold !== null) payload.pool.failure_threshold = poolFailureThreshold;
+
       try {
         const res = await fetch('/api/settings', {
           method: 'PUT',
@@ -2343,6 +2983,10 @@
 
         const data = await res.json();
         if (res.ok) {
+          if (data.settings) {
+            settingsCache = data.settings;
+          }
+          renderProxyLinks();
           if (data.need_reload) {
             showToast('设置已保存，需要重载配置才能生效', 'success');
           } else {
@@ -2608,6 +3252,13 @@
       const authenticated = await checkAuth();
       if (authenticated) {
         isAuthenticated = true;
+        await loadSettingsCache();
+        const details = document.getElementById('proxyNodeLinksDetails');
+        if (details && !details.dataset.bound) {
+          details.addEventListener('toggle', renderProxyLinks);
+          details.dataset.bound = '1';
+        }
+        renderProxyLinks();
         refresh();
         fetchSubscriptionStatus();
         startAutoRefresh();

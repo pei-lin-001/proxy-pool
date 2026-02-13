@@ -1247,7 +1247,7 @@ func (c *Config) Save() error {
 	return c.SaveNodes()
 }
 
-// SaveSettings persists only config settings (external_ip, probe_target, skip_cert_verify, subscriptions, subscription_refresh, node_filter)
+// SaveSettings persists dynamic config settings that are editable from the WebUI.
 // without touching nodes.txt. Use this for settings API updates.
 func (c *Config) SaveSettings() error {
 	if c == nil {
@@ -1267,7 +1267,16 @@ func (c *Config) SaveSettings() error {
 	}
 
 	saveCfg.ExternalIP = c.ExternalIP
+	saveCfg.Mode = c.Mode
+	saveCfg.LogLevel = c.LogLevel
+	saveCfg.ConnectTimeout = c.ConnectTimeout
+	saveCfg.Listener = c.Listener
+	saveCfg.MultiPort = c.MultiPort
+	saveCfg.Pool = c.Pool
+	saveCfg.Management.Enabled = c.Management.Enabled
+	saveCfg.Management.Listen = c.Management.Listen
 	saveCfg.Management.ProbeTarget = c.Management.ProbeTarget
+	saveCfg.Management.Password = c.Management.Password
 	saveCfg.SkipCertVerify = c.SkipCertVerify
 	saveCfg.Subscriptions = c.Subscriptions
 	saveCfg.SubscriptionRefresh = c.SubscriptionRefresh
