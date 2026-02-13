@@ -57,6 +57,23 @@ go build -tags "with_utls with_quic with_grpc with_wireguard with_gvisor" -o eas
 - Pool entry: `http://username:password@127.0.0.1:2323`
 - Web UI: `http://127.0.0.1:9090`
 
+## Quick start (Docker)
+
+This repo’s `docker-compose.yml` builds the image from source (so your code changes take effect).
+
+```bash
+cp config.example.yaml config.yaml
+cp nodes.example nodes.txt
+./start.sh
+```
+
+Update:
+
+```bash
+git pull --ff-only
+./start.sh
+```
+
 ## Web UI
 
 Open `http://<management.listen>`:

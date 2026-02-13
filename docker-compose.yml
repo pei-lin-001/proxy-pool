@@ -1,6 +1,9 @@
 services:
   proxy-pool:
-    image: ghcr.io/jasonwong1991/easy_proxies:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: proxy-pool:local
     container_name: proxy-pool
     restart: unless-stopped
     # 方式一：使用主机网络模式（推荐，支持端口自动重分配）
@@ -10,7 +13,7 @@ services:
     #   # Pool 模式入口（pool/hybrid 模式使用）
     #   - "2323:2323"
     #   # Web 监控面板
-    #   - "9091:9091"
+    #   - "9090:9090"
     #   # Multi-port 端口范围（multi-port/hybrid 模式使用，根据节点数量调整）
     #   - "24000-24200:24000-24200"
     #
