@@ -45,17 +45,14 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		server.SetConfig(cfg)
 	}
 
-	// Create and start SubscriptionManager if enabled
-	var subMgr *subscription.Manager
-	if cfg.SubscriptionRefresh.Enabled && len(cfg.Subscriptions) > 0 {
-		subMgr = subscription.New(cfg, boxMgr)
-		subMgr.Start()
-		defer subMgr.Stop()
+	// Create SubscriptionManager (loop is lightweight when disabled)
+	subMgr := subscription.New(cfg, boxMgr)
+	subMgr.Start()
+	defer subMgr.Stop()
 
-		// Wire up subscription manager to monitor server for API endpoints
-		if server := boxMgr.MonitorServer(); server != nil {
-			server.SetSubscriptionRefresher(subMgr)
-		}
+	// Wire up subscription manager to monitor server for API endpoints
+	if server := boxMgr.MonitorServer(); server != nil {
+		server.SetSubscriptionRefresher(subMgr)
 	}
 
 	// Wait for shutdown signal

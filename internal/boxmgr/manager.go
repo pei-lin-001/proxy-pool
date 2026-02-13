@@ -143,16 +143,19 @@ func (m *Manager) Start(ctx context.Context) error {
 	}
 	m.mu.Unlock()
 
-	// Wait for initial health check if min nodes configured
+	// Wait for initial health check (async) if min nodes configured.
+	// Do not block startup/UI availability.
 	if cfg.SubscriptionRefresh.MinAvailableNodes > 0 {
 		timeout := cfg.SubscriptionRefresh.HealthCheckTimeout
 		if timeout <= 0 {
 			timeout = defaultHealthCheckTimeout
 		}
-		if err := m.waitForHealthCheck(timeout); err != nil {
-			m.logger.Warnf("initial health check warning: %v", err)
-			// Don't fail startup, just warn
-		}
+		go func() {
+			if err := m.waitForHealthCheck(timeout); err != nil {
+				m.logger.Warnf("initial health check warning: %v", err)
+				// Don't fail startup, just warn
+			}
+		}()
 	}
 
 	m.logger.Infof("sing-box instance started with %d nodes", len(cfg.Nodes))
@@ -196,6 +199,10 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 
 	// Reset shared state store to ensure clean state for new config
 	pool.ResetSharedStateStore()
+	// Clear monitor nodes so UI reflects only the new active configuration.
+	if m.monitorMgr != nil {
+		m.monitorMgr.ResetNodes()
+	}
 
 	// Create and start new box instance with automatic port conflict resolution
 	var instance *box.Box
@@ -227,7 +234,18 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 
 	m.mu.Lock()
 	m.currentBox = instance
-	m.cfg = newCfg
+	// Keep the original config pointer stable so MonitorServer/SubscriptionManager
+	// continue to read and mutate the same shared config object after reload.
+	if m.cfg == nil {
+		m.cfg = newCfg
+	} else {
+		prevFilePath := m.cfg.FilePath()
+		*m.cfg = *newCfg
+		// Preserve file path if the incoming config was constructed without it.
+		if m.cfg.FilePath() == "" && prevFilePath != "" {
+			m.cfg.SetFilePath(prevFilePath)
+		}
+	}
 	m.mu.Unlock()
 
 	m.logger.Infof("reload completed successfully with %d nodes", len(newCfg.Nodes))
@@ -252,7 +270,6 @@ func (m *Manager) rollbackToOldConfig(ctx context.Context, oldCfg *config.Config
 	}
 	m.mu.Lock()
 	m.currentBox = instance
-	m.cfg = oldCfg
 	m.mu.Unlock()
 	m.logger.Infof("rollback successful")
 }
@@ -303,7 +320,17 @@ func (m *Manager) createBox(ctx context.Context, cfg *config.Config) (*box.Box, 
 		return nil, errors.New("monitor manager not initialized")
 	}
 
-	opts, err := builder.Build(cfg)
+	// Build against a cloned config to avoid mutating the shared config object (e.g., attaching GeoIP metadata).
+	cfgForBuild := *cfg
+	cfgForBuild.Nodes = cloneNodes(cfg.Nodes)
+	cfgForBuild.SetFilePath(cfg.FilePath())
+
+	// Populate GeoIP metadata when node_filter requires it.
+	if cfgForBuild.NodeFilter.NeedsGeo() && (len(cfgForBuild.NodeFilter.Include) > 0 || len(cfgForBuild.NodeFilter.Exclude) > 0) {
+		cfgForBuild.PopulateNodeGeo(ctx)
+	}
+
+	opts, err := builder.Build(&cfgForBuild)
 	if err != nil {
 		return nil, fmt.Errorf("build sing-box options: %w", err)
 	}
@@ -519,11 +546,12 @@ func (m *Manager) CreateNode(ctx context.Context, node config.NodeConfig) (confi
 		return config.NodeConfig{}, err
 	}
 
-	// Determine source: if subscriptions exist, new nodes go to nodes.txt (subscription source)
-	// Otherwise, if nodes_file exists, use file source; else inline
-	if len(m.cfg.Subscriptions) > 0 {
-		normalized.Source = config.NodeSourceSubscription
-	} else if m.cfg.NodesFile != "" {
+	// Determine source for newly created nodes.
+	//
+	// Important: When subscriptions are enabled, nodes.txt is subscription-managed and will be overwritten
+	// on the next refresh. To prevent user-added nodes from being lost, default to saving custom nodes
+	// inline in config.yaml.
+	if len(m.cfg.Subscriptions) == 0 && m.cfg.NodesFile != "" {
 		normalized.Source = config.NodeSourceFile
 	} else {
 		normalized.Source = config.NodeSourceInline

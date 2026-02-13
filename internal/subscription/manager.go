@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -49,6 +50,11 @@ type Manager struct {
 	cancel        context.CancelFunc
 	refreshMu     sync.Mutex // prevents concurrent refreshes
 	manualRefresh chan struct{}
+	configChanged chan struct{}
+	started       bool
+
+	subscriptions []string
+	refreshCfg    config.SubscriptionRefreshConfig
 
 	// Track nodes.txt content hash to detect modifications
 	lastSubHash      string    // Hash of nodes.txt content after last subscription refresh
@@ -64,6 +70,11 @@ func New(cfg *config.Config, boxMgr *boxmgr.Manager, opts ...Option) *Manager {
 		ctx:           ctx,
 		cancel:        cancel,
 		manualRefresh: make(chan struct{}, 1),
+		configChanged: make(chan struct{}, 1),
+	}
+	if cfg != nil {
+		m.subscriptions = append([]string(nil), cfg.Subscriptions...)
+		m.refreshCfg = cfg.SubscriptionRefresh
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -71,24 +82,26 @@ func New(cfg *config.Config, boxMgr *boxmgr.Manager, opts ...Option) *Manager {
 	if m.logger == nil {
 		m.logger = defaultLogger{}
 	}
+
+	// Initialize status/hash from existing nodes file (e.g., nodes.txt written on startup).
+	// This prevents the UI from showing 0 nodes until the first timed refresh happens and
+	// enables "nodes_modified" warnings immediately.
+	m.initNodesStateFromFile()
 	return m
 }
 
 // Start begins the periodic refresh loop.
 func (m *Manager) Start() {
-	if !m.baseCfg.SubscriptionRefresh.Enabled {
-		m.logger.Infof("subscription refresh disabled")
+	m.mu.Lock()
+	if m.started {
+		m.mu.Unlock()
 		return
 	}
-	if len(m.baseCfg.Subscriptions) == 0 {
-		m.logger.Infof("no subscriptions configured, refresh disabled")
-		return
-	}
+	m.started = true
+	m.mu.Unlock()
 
-	interval := m.baseCfg.SubscriptionRefresh.Interval
-	m.logger.Infof("starting subscription refresh, interval: %s", interval)
-
-	go m.refreshLoop(interval)
+	m.logger.Infof("starting subscription manager loop")
+	go m.refreshLoop()
 }
 
 // Stop stops the periodic refresh.
@@ -96,6 +109,100 @@ func (m *Manager) Stop() {
 	if m.cancel != nil {
 		m.cancel()
 	}
+}
+
+// UpdateSettings updates subscriptions and refresh settings at runtime (thread-safe).
+// This is used by the settings API so manual refresh / periodic refresh can take effect without restart.
+func (m *Manager) UpdateSettings(subscriptions []string, refreshCfg config.SubscriptionRefreshConfig) {
+	if m == nil {
+		return
+	}
+
+	// Track changes to decide whether to trigger an immediate refresh.
+	m.mu.Lock()
+	prevSubs := append([]string(nil), m.subscriptions...)
+	prevEnabled := m.refreshCfg.Enabled
+	m.subscriptions = append([]string(nil), subscriptions...)
+	m.refreshCfg = refreshCfg
+	m.mu.Unlock()
+
+	subsChanged := !equalStringSlices(prevSubs, subscriptions)
+	enabledTurnedOn := !prevEnabled && refreshCfg.Enabled
+
+	// If the user changed subscriptions (or just enabled auto-refresh), refresh once immediately.
+	//
+	// Note: We refresh even when auto-refresh is disabled so users can paste a subscription URL,
+	// save settings, and see nodes without needing to enable the scheduler.
+	if (subsChanged || enabledTurnedOn) && len(subscriptions) > 0 {
+		select {
+		case m.manualRefresh <- struct{}{}:
+		default:
+		}
+	}
+
+	select {
+	case m.configChanged <- struct{}{}:
+	default:
+	}
+}
+
+// initNodesStateFromFile initializes node_count / last_refresh and nodes.txt hash baseline.
+// This is best-effort and silently ignores errors.
+func (m *Manager) initNodesStateFromFile() {
+	if m == nil || m.baseCfg == nil {
+		return
+	}
+
+	nodesFilePath := m.getNodesFilePath()
+	if nodesFilePath == "" {
+		return
+	}
+
+	info, err := os.Stat(nodesFilePath)
+	if err != nil {
+		return
+	}
+
+	data, err := os.ReadFile(nodesFilePath)
+	if err != nil {
+		return
+	}
+
+	var nodes []config.NodeConfig
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if isProxyURI(line) {
+			nodes = append(nodes, config.NodeConfig{URI: line})
+		}
+	}
+
+	hash := m.computeNodesHash(nodes)
+
+	m.mu.Lock()
+	m.lastSubHash = hash
+	m.lastNodesModTime = info.ModTime()
+	if len(nodes) > 0 {
+		m.status.NodeCount = len(nodes)
+		m.status.LastRefresh = info.ModTime()
+	}
+	m.status.NodesModified = false
+	m.mu.Unlock()
+}
+
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // RefreshNow triggers an immediate refresh.
@@ -107,12 +214,14 @@ func (m *Manager) RefreshNow() error {
 	}
 
 	// Wait for refresh to complete or timeout
-	timeout := m.baseCfg.SubscriptionRefresh.Timeout
+	refreshCfg := m.getRefreshConfig()
+	timeout := refreshCfg.Timeout
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
 
-	ctx, cancel := context.WithTimeout(m.ctx, timeout+m.baseCfg.SubscriptionRefresh.HealthCheckTimeout)
+	healthTimeout := refreshCfg.HealthCheckTimeout
+	ctx, cancel := context.WithTimeout(m.ctx, timeout+healthTimeout)
 	defer cancel()
 
 	// Poll status until refresh completes
@@ -147,34 +256,79 @@ func (m *Manager) Status() monitor.SubscriptionStatus {
 	return status
 }
 
-// refreshLoop runs the periodic refresh.
-func (m *Manager) refreshLoop(interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	// Update next refresh time
-	m.mu.Lock()
-	m.status.NextRefresh = time.Now().Add(interval)
-	m.mu.Unlock()
-
+func (m *Manager) refreshLoop() {
 	for {
-		select {
-		case <-m.ctx.Done():
-			return
-		case <-ticker.C:
-			m.doRefresh()
-			m.mu.Lock()
-			m.status.NextRefresh = time.Now().Add(interval)
-			m.mu.Unlock()
-		case <-m.manualRefresh:
-			m.doRefresh()
-			// Reset ticker after manual refresh
-			ticker.Reset(interval)
-			m.mu.Lock()
-			m.status.NextRefresh = time.Now().Add(interval)
-			m.mu.Unlock()
+		subs, refreshCfg := m.getSettingsSnapshot()
+		enabled := refreshCfg.Enabled && len(subs) > 0
+		interval := refreshCfg.Interval
+		if interval <= 0 {
+			interval = 1 * time.Hour
 		}
+
+		if !enabled {
+			m.mu.Lock()
+			m.status.NextRefresh = time.Time{}
+			m.mu.Unlock()
+			select {
+			case <-m.ctx.Done():
+				return
+			case <-m.manualRefresh:
+				// Allow manual refresh even when auto refresh is disabled,
+				// as long as subscriptions are configured.
+				m.doRefresh()
+			case <-m.configChanged:
+				// Re-check settings.
+			}
+			continue
+		}
+
+		m.logger.Infof("subscription refresh enabled, interval: %s, sources: %d", interval, len(subs))
+
+		ticker := time.NewTicker(interval)
+		m.mu.Lock()
+		m.status.NextRefresh = time.Now().Add(interval)
+		m.mu.Unlock()
+
+		for {
+			select {
+			case <-m.ctx.Done():
+				ticker.Stop()
+				return
+			case <-ticker.C:
+				m.doRefresh()
+				m.mu.Lock()
+				m.status.NextRefresh = time.Now().Add(interval)
+				m.mu.Unlock()
+			case <-m.manualRefresh:
+				m.doRefresh()
+				ticker.Reset(interval)
+				m.mu.Lock()
+				m.status.NextRefresh = time.Now().Add(interval)
+				m.mu.Unlock()
+			case <-m.configChanged:
+				ticker.Stop()
+				goto recheck
+			}
+		}
+
+	recheck:
+		continue
 	}
+}
+
+func (m *Manager) getRefreshConfig() config.SubscriptionRefreshConfig {
+	m.mu.RLock()
+	cfg := m.refreshCfg
+	m.mu.RUnlock()
+	return cfg
+}
+
+func (m *Manager) getSettingsSnapshot() ([]string, config.SubscriptionRefreshConfig) {
+	m.mu.RLock()
+	subs := append([]string(nil), m.subscriptions...)
+	cfg := m.refreshCfg
+	m.mu.RUnlock()
+	return subs, cfg
 }
 
 // doRefresh performs a single refresh operation.
@@ -199,8 +353,22 @@ func (m *Manager) doRefresh() {
 
 	m.logger.Infof("starting subscription refresh")
 
+	subs, refreshCfg := m.getSettingsSnapshot()
+	if len(subs) == 0 {
+		m.logger.Warnf("no subscriptions configured, skipping refresh")
+		m.mu.Lock()
+		m.status.LastError = "no subscriptions configured"
+		m.status.LastRefresh = time.Now()
+		m.mu.Unlock()
+		return
+	}
+
 	// Fetch nodes from all subscriptions
-	nodes, err := m.fetchAllSubscriptions()
+	timeout := refreshCfg.Timeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	nodes, err := m.fetchAllSubscriptions(subs, timeout)
 	if err != nil {
 		m.logger.Errorf("fetch subscriptions failed: %v", err)
 		m.mu.Lock()
@@ -364,16 +532,15 @@ func (m *Manager) MarkNodesModified() {
 }
 
 // fetchAllSubscriptions fetches nodes from all configured subscription URLs.
-func (m *Manager) fetchAllSubscriptions() ([]config.NodeConfig, error) {
+func (m *Manager) fetchAllSubscriptions(subscriptions []string, timeout time.Duration) ([]config.NodeConfig, error) {
 	var allNodes []config.NodeConfig
 	var lastErr error
 
-	timeout := m.baseCfg.SubscriptionRefresh.Timeout
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
 
-	for _, subURL := range m.baseCfg.Subscriptions {
+	for _, subURL := range subscriptions {
 		nodes, err := m.fetchSubscription(subURL, timeout)
 		if err != nil {
 			m.logger.Warnf("failed to fetch %s: %v", subURL, err)
@@ -393,33 +560,62 @@ func (m *Manager) fetchAllSubscriptions() ([]config.NodeConfig, error) {
 
 // fetchSubscription fetches and parses a single subscription URL.
 func (m *Manager) fetchSubscription(subURL string, timeout time.Duration) ([]config.NodeConfig, error) {
+	subURL = config.NormalizeSubscriptionURL(subURL)
+	if subURL == "" {
+		return nil, fmt.Errorf("empty subscription url")
+	}
 	ctx, cancel := context.WithTimeout(m.ctx, timeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, "GET", subURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
+	userAgents := []string{
+		"",
+		"clash",
+		"curl/8",
 	}
 
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-	req.Header.Set("Accept", "*/*")
+	var lastErr error
+	for _, ua := range userAgents {
+		req, err := http.NewRequestWithContext(ctx, "GET", subURL, nil)
+		if err != nil {
+			return nil, fmt.Errorf("create request: %w", err)
+		}
+		if ua != "" {
+			req.Header.Set("User-Agent", ua)
+		}
 
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("fetch: %w", err)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("fetch: %w", err)
+			continue
+		}
+
+		body, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			lastErr = fmt.Errorf("read body: %w", readErr)
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			lastErr = fmt.Errorf("status %d", resp.StatusCode)
+			continue
+		}
+
+		nodes, parseErr := config.ParseSubscriptionContent(string(body))
+		if parseErr != nil {
+			lastErr = parseErr
+			continue
+		}
+		if len(nodes) == 0 {
+			lastErr = fmt.Errorf("no proxy nodes found in subscription response")
+			continue
+		}
+		return nodes, nil
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("status %d", resp.StatusCode)
+	if lastErr != nil {
+		return nil, lastErr
 	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read body: %w", err)
-	}
-
-	return parseSubscriptionContent(string(body))
+	return nil, nil
 }
 
 // createNewConfig creates a new config with updated nodes while preserving other settings.
@@ -448,12 +644,28 @@ func (m *Manager) createNewConfig(nodes []config.NodeConfig) *config.Config {
 
 		// Extract name from URI fragment if not provided
 		if nodes[i].Name == "" {
-			if parsed, err := url.Parse(nodes[i].URI); err == nil && parsed.Fragment != "" {
-				if decoded, err := url.QueryUnescape(parsed.Fragment); err == nil {
-					nodes[i].Name = decoded
-				} else {
-					nodes[i].Name = parsed.Fragment
+			if parsed, err := url.Parse(nodes[i].URI); err == nil {
+				if parsed.Fragment != "" {
+					if decoded, err := url.QueryUnescape(parsed.Fragment); err == nil {
+						nodes[i].Name = decoded
+					} else {
+						nodes[i].Name = parsed.Fragment
+					}
 				}
+				// Shadowrocket style: use remarks= as display name.
+				if nodes[i].Name == "" {
+					q := parsed.Query()
+					if remarks := strings.TrimSpace(q.Get("remarks")); remarks != "" {
+						nodes[i].Name = remarks
+					} else if ps := strings.TrimSpace(q.Get("ps")); ps != "" {
+						nodes[i].Name = ps
+					}
+				}
+			}
+		}
+		if nodes[i].Name == "" && strings.HasPrefix(strings.ToLower(nodes[i].URI), "vmess://") {
+			if ps := extractNameFromVMessURI(nodes[i].URI); ps != "" {
+				nodes[i].Name = ps
 			}
 		}
 		if nodes[i].Name == "" {
@@ -465,60 +677,6 @@ func (m *Manager) createNewConfig(nodes []config.NodeConfig) *config.Config {
 	return &newCfg
 }
 
-// parseSubscriptionContent parses subscription content in various formats.
-// This is a simplified version - the full implementation is in config package.
-func parseSubscriptionContent(content string) ([]config.NodeConfig, error) {
-	content = strings.TrimSpace(content)
-
-	// Check if it's base64 encoded
-	if isBase64(content) {
-		decoded, err := base64.StdEncoding.DecodeString(content)
-		if err != nil {
-			decoded, err = base64.RawStdEncoding.DecodeString(content)
-			if err != nil {
-				return parseNodesFromContent(content)
-			}
-		}
-		content = string(decoded)
-	}
-
-	// Parse as plain text (one URI per line)
-	return parseNodesFromContent(content)
-}
-
-func isBase64(s string) bool {
-	s = strings.TrimSpace(s)
-	if len(s) == 0 {
-		return false
-	}
-	s = strings.ReplaceAll(s, "\n", "")
-	s = strings.ReplaceAll(s, "\r", "")
-	if strings.Contains(s, "://") {
-		return false
-	}
-	_, err := base64.StdEncoding.DecodeString(s)
-	if err != nil {
-		_, err = base64.RawStdEncoding.DecodeString(s)
-	}
-	return err == nil
-}
-
-func parseNodesFromContent(content string) ([]config.NodeConfig, error) {
-	var nodes []config.NodeConfig
-	lines := strings.Split(content, "\n")
-
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		if isProxyURI(line) {
-			nodes = append(nodes, config.NodeConfig{URI: line})
-		}
-	}
-	return nodes, nil
-}
-
 func isProxyURI(s string) bool {
 	schemes := []string{"vmess://", "vless://", "trojan://", "ss://", "ssr://", "hysteria://", "hysteria2://", "hy2://"}
 	lower := strings.ToLower(s)
@@ -528,6 +686,44 @@ func isProxyURI(s string) bool {
 		}
 	}
 	return false
+}
+
+type vmessJSONName struct {
+	PS string `json:"ps"`
+}
+
+func extractNameFromVMessURI(uri string) string {
+	encoded := strings.TrimSpace(strings.TrimPrefix(uri, "vmess://"))
+	if encoded == "" {
+		return ""
+	}
+	decoded, err := decodeBase64Any(encoded)
+	if err != nil {
+		return ""
+	}
+	var payload vmessJSONName
+	if err := json.Unmarshal(decoded, &payload); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(payload.PS)
+}
+
+func decodeBase64Any(value string) ([]byte, error) {
+	encodings := []*base64.Encoding{
+		base64.RawURLEncoding,
+		base64.URLEncoding,
+		base64.RawStdEncoding,
+		base64.StdEncoding,
+	}
+	var lastErr error
+	for _, enc := range encodings {
+		decoded, err := enc.DecodeString(value)
+		if err == nil {
+			return decoded, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
 }
 
 type defaultLogger struct{}

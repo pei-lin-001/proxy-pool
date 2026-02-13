@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -11,8 +12,11 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
+
+	"easy_proxies/internal/geo"
 
 	"gopkg.in/yaml.v3"
 )
@@ -25,12 +29,14 @@ type Config struct {
 	Pool                PoolConfig                `yaml:"pool"`
 	Management          ManagementConfig          `yaml:"management"`
 	SubscriptionRefresh SubscriptionRefreshConfig `yaml:"subscription_refresh"`
+	NodeFilter          NodeFilterConfig          `yaml:"node_filter"`
 	Nodes               []NodeConfig              `yaml:"nodes"`
 	NodesFile           string                    `yaml:"nodes_file"`    // 节点文件路径，每行一个 URI
 	Subscriptions       []string                  `yaml:"subscriptions"` // 订阅链接列表
-	ExternalIP          string                    `yaml:"external_ip"`      // 外部 IP 地址，用于导出时替换 0.0.0.0
+	ExternalIP          string                    `yaml:"external_ip"`   // 外部 IP 地址，用于导出时替换 0.0.0.0
 	LogLevel            string                    `yaml:"log_level"`
 	SkipCertVerify      bool                      `yaml:"skip_cert_verify"` // 全局跳过 SSL 证书验证
+	ConnectTimeout      time.Duration             `yaml:"connect_timeout"`  // 连接超时（用于节点出站拨号），避免长时间卡住
 
 	filePath string `yaml:"-"` // 配置文件路径，用于保存
 }
@@ -93,12 +99,166 @@ type NodeConfig struct {
 	Username string     `yaml:"username,omitempty" json:"username,omitempty"`
 	Password string     `yaml:"password,omitempty" json:"password,omitempty"`
 	Source   NodeSource `yaml:"-" json:"source,omitempty"` // Runtime only, not persisted
+	Geo      *geo.Info  `yaml:"-" json:"geo,omitempty"`    // Runtime only, GeoIP metadata for server IP
+}
+
+// NodeFilterConfig controls which nodes are enabled at runtime (e.g. filter by region keyword).
+//
+// Matching happens against:
+// - target=name: NodeConfig.Name (auto-extracted from URI fragment when missing)
+// - target=geo: resolved GeoIP text (country/region/city)
+// - target=name_or_geo: name OR GeoIP text
+// - If Include is empty: all nodes are eligible.
+// - If Include is non-empty: node must match at least one include pattern.
+// - If Exclude matches: node is dropped even if included.
+type NodeFilterConfig struct {
+	Target   string   `yaml:"target" json:"target"` // name|geo|name_or_geo
+	Include  []string `yaml:"include" json:"include"`
+	Exclude  []string `yaml:"exclude" json:"exclude"`
+	UseRegex bool     `yaml:"use_regex" json:"use_regex"`
 }
 
 // NodeKey returns a unique identifier for the node based on its URI.
 // This is used to preserve port assignments across reloads.
 func (n *NodeConfig) NodeKey() string {
 	return n.URI
+}
+
+// FilterNodes returns the subset of nodes that match the configured node_filter.
+// It never mutates the underlying Config.
+func (c *Config) FilterNodes() []NodeConfig {
+	if c == nil {
+		return nil
+	}
+	return FilterNodes(c.Nodes, c.NodeFilter)
+}
+
+// FilterNodes returns nodes that match the filter. If filter.Include is empty, it includes all nodes.
+func FilterNodes(nodes []NodeConfig, filter NodeFilterConfig) []NodeConfig {
+	include := normalizePatterns(filter.Include)
+	exclude := normalizePatterns(filter.Exclude)
+	target := strings.ToLower(strings.TrimSpace(filter.Target))
+	if target == "" {
+		target = "name"
+	}
+
+	if len(include) == 0 && len(exclude) == 0 {
+		out := make([]NodeConfig, len(nodes))
+		copy(out, nodes)
+		return out
+	}
+
+	var (
+		includeRE = compileRegexps(include, filter.UseRegex)
+		excludeRE = compileRegexps(exclude, filter.UseRegex)
+	)
+
+	out := make([]NodeConfig, 0, len(nodes))
+	geoKnown := 0
+	for _, node := range nodes {
+		name := strings.TrimSpace(node.Name)
+		if name == "" {
+			name = strings.TrimSpace(node.URI)
+		}
+		geoText := ""
+		if node.Geo != nil {
+			geoText = strings.TrimSpace(node.Geo.Text())
+		}
+		if geoText != "" {
+			geoKnown++
+		}
+
+		switch target {
+		case "geo":
+			if len(include) > 0 && !matchesAny(geoText, include, includeRE, filter.UseRegex) {
+				continue
+			}
+			if len(exclude) > 0 && matchesAny(geoText, exclude, excludeRE, filter.UseRegex) {
+				continue
+			}
+		case "name_or_geo":
+			if len(include) > 0 && !matchesAny(name, include, includeRE, filter.UseRegex) && !matchesAny(geoText, include, includeRE, filter.UseRegex) {
+				continue
+			}
+			if len(exclude) > 0 && (matchesAny(name, exclude, excludeRE, filter.UseRegex) || matchesAny(geoText, exclude, excludeRE, filter.UseRegex)) {
+				continue
+			}
+		default: // "name"
+			if len(include) > 0 && !matchesAny(name, include, includeRE, filter.UseRegex) {
+				continue
+			}
+			if len(exclude) > 0 && matchesAny(name, exclude, excludeRE, filter.UseRegex) {
+				continue
+			}
+		}
+		out = append(out, node)
+	}
+
+	// If user requested GeoIP-based filtering but no GeoIP metadata is available at all,
+	// skip the filter to avoid "0 nodes" on environments where GeoIP lookup is blocked.
+	if len(out) == 0 && target == "geo" && (len(include) > 0 || len(exclude) > 0) && geoKnown == 0 {
+		fallback := make([]NodeConfig, len(nodes))
+		copy(fallback, nodes)
+		return fallback
+	}
+
+	return out
+}
+
+func normalizePatterns(patterns []string) []string {
+	if len(patterns) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(patterns))
+	for _, p := range patterns {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+func compileRegexps(patterns []string, useRegex bool) []*regexp.Regexp {
+	if !useRegex || len(patterns) == 0 {
+		return nil
+	}
+	res := make([]*regexp.Regexp, len(patterns))
+	for i, p := range patterns {
+		// Compile as-is; callers can use (?i) for case-insensitive matching.
+		re, err := regexp.Compile(p)
+		if err != nil {
+			// Keep nil; match helper will treat it as non-matching.
+			continue
+		}
+		res[i] = re
+	}
+	return res
+}
+
+func matchesAny(value string, patterns []string, res []*regexp.Regexp, useRegex bool) bool {
+	if value == "" {
+		return false
+	}
+	if useRegex {
+		for _, re := range res {
+			if re == nil {
+				continue
+			}
+			if re.MatchString(value) {
+				return true
+			}
+		}
+		return false
+	}
+	valueLower := strings.ToLower(value)
+	for _, p := range patterns {
+		if strings.Contains(valueLower, strings.ToLower(p)) {
+			return true
+		}
+	}
+	return false
 }
 
 // Load reads YAML config from disk and applies defaults/validation.
@@ -152,6 +312,9 @@ func (c *Config) normalize() error {
 	}
 	if c.Pool.BlacklistDuration <= 0 {
 		c.Pool.BlacklistDuration = 24 * time.Hour
+	}
+	if c.ConnectTimeout <= 0 {
+		c.ConnectTimeout = 15 * time.Second
 	}
 	if c.MultiPort.Address == "" {
 		c.MultiPort.Address = "0.0.0.0"
@@ -208,7 +371,11 @@ func (c *Config) normalize() error {
 	if len(c.Subscriptions) > 0 {
 		var subNodes []NodeConfig
 		subTimeout := c.SubscriptionRefresh.Timeout
-		for _, subURL := range c.Subscriptions {
+		for _, rawSubURL := range c.Subscriptions {
+			subURL := NormalizeSubscriptionURL(rawSubURL)
+			if subURL == "" {
+				continue
+			}
 			nodes, err := loadNodesFromSubscription(subURL, subTimeout)
 			if err != nil {
 				log.Printf("⚠️ Failed to load subscription %q: %v (skipping)", subURL, err)
@@ -252,13 +419,29 @@ func (c *Config) normalize() error {
 
 		// Auto-extract name from URI fragment (#name) if not provided
 		if c.Nodes[idx].Name == "" {
-			if parsed, err := url.Parse(c.Nodes[idx].URI); err == nil && parsed.Fragment != "" {
-				// URL decode the fragment to handle encoded characters
-				if decoded, err := url.QueryUnescape(parsed.Fragment); err == nil {
-					c.Nodes[idx].Name = decoded
-				} else {
-					c.Nodes[idx].Name = parsed.Fragment
+			if parsed, err := url.Parse(c.Nodes[idx].URI); err == nil {
+				if parsed.Fragment != "" {
+					// URL decode the fragment to handle encoded characters
+					if decoded, err := url.QueryUnescape(parsed.Fragment); err == nil {
+						c.Nodes[idx].Name = decoded
+					} else {
+						c.Nodes[idx].Name = parsed.Fragment
+					}
 				}
+				// Shadowrocket style: use remarks= as display name.
+				if c.Nodes[idx].Name == "" {
+					q := parsed.Query()
+					if remarks := strings.TrimSpace(q.Get("remarks")); remarks != "" {
+						c.Nodes[idx].Name = remarks
+					} else if ps := strings.TrimSpace(q.Get("ps")); ps != "" {
+						c.Nodes[idx].Name = ps
+					}
+				}
+			}
+		}
+		if c.Nodes[idx].Name == "" && strings.HasPrefix(strings.ToLower(c.Nodes[idx].URI), "vmess://") {
+			if ps := extractNameFromVMessURI(c.Nodes[idx].URI); ps != "" {
+				c.Nodes[idx].Name = ps
 			}
 		}
 
@@ -495,6 +678,10 @@ func loadNodesFromFile(path string) ([]NodeConfig, error) {
 // loadNodesFromSubscription fetches and parses nodes from a subscription URL
 // Supports multiple formats: base64 encoded, plain text, clash yaml, etc.
 func loadNodesFromSubscription(subURL string, timeout time.Duration) ([]NodeConfig, error) {
+	subURL = NormalizeSubscriptionURL(subURL)
+	if subURL == "" {
+		return nil, errors.New("empty subscription url")
+	}
 	if timeout <= 0 {
 		timeout = 30 * time.Second
 	}
@@ -502,52 +689,76 @@ func loadNodesFromSubscription(subURL string, timeout time.Duration) ([]NodeConf
 		Timeout: timeout,
 	}
 
-	req, err := http.NewRequest("GET", subURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
+	userAgents := []string{
+		"",       // default (Go-http-client/1.1) - many providers serve base64 here
+		"clash",  // some providers serve Clash YAML
+		"curl/8", // some providers treat curl specially
 	}
 
-	// Set common headers to avoid being blocked
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-	req.Header.Set("Accept", "*/*")
+	var lastErr error
+	for _, ua := range userAgents {
+		req, err := http.NewRequest("GET", subURL, nil)
+		if err != nil {
+			return nil, fmt.Errorf("create request: %w", err)
+		}
+		if ua != "" {
+			req.Header.Set("User-Agent", ua)
+		}
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("fetch subscription: %w", err)
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("fetch subscription: %w", err)
+			continue
+		}
+
+		body, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			lastErr = fmt.Errorf("read response: %w", readErr)
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			lastErr = fmt.Errorf("subscription returned status %d", resp.StatusCode)
+			continue
+		}
+
+		nodes, parseErr := ParseSubscriptionContent(string(body))
+		if parseErr != nil {
+			lastErr = parseErr
+			continue
+		}
+		if len(nodes) == 0 {
+			lastErr = errors.New("no proxy nodes found in subscription response")
+			continue
+		}
+		return nodes, nil
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("subscription returned status %d", resp.StatusCode)
+	if lastErr != nil {
+		return nil, lastErr
 	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
-	}
-
-	content := string(body)
-
-	// Try to detect and parse different formats
-	return parseSubscriptionContent(content)
+	return nil, nil
 }
 
-// parseSubscriptionContent tries to parse subscription content in various formats
-func parseSubscriptionContent(content string) ([]NodeConfig, error) {
+// ParseSubscriptionContent tries to parse subscription content in various formats.
+// Supported formats:
+// - Base64 encoded (V2Ray subscription)
+// - Clash YAML (contains "proxies:")
+// - Plain text (one URI per line)
+func ParseSubscriptionContent(content string) ([]NodeConfig, error) {
 	content = strings.TrimSpace(content)
+	if content == "" {
+		return nil, nil
+	}
 
 	// Check if it's base64 encoded (common for v2ray subscriptions)
 	if isBase64(content) {
-		decoded, err := base64.StdEncoding.DecodeString(content)
-		if err != nil {
-			// Try URL-safe base64
-			decoded, err = base64.RawStdEncoding.DecodeString(content)
-			if err != nil {
-				// Not base64, try as plain text
-				return parseNodesFromContent(content)
-			}
+		if decoded, err := decodeBase64Subscription(content); err == nil {
+			content = decoded
+		} else {
+			// Not base64, try as plain text
+			return parseNodesFromContent(content)
 		}
-		content = string(decoded)
 	}
 
 	// Check if it's YAML (Clash format)
@@ -556,7 +767,30 @@ func parseSubscriptionContent(content string) ([]NodeConfig, error) {
 	}
 
 	// Parse as plain text (one URI per line)
-	return parseNodesFromContent(content)
+	nodes, err := parseNodesFromContent(content)
+	if err != nil {
+		return nil, err
+	}
+	if len(nodes) == 0 && looksLikeHTML(content) {
+		return nil, errors.New("subscription response looks like HTML (可能需要登录/鉴权，或订阅地址错误)")
+	}
+	return nodes, nil
+}
+
+func NormalizeSubscriptionURL(raw string) string {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return ""
+	}
+	// Common fullwidth punctuation from IME input.
+	replacer := strings.NewReplacer(
+		"？", "?",
+		"＆", "&",
+		"＃", "#",
+		"　", " ", // fullwidth space
+	)
+	value = replacer.Replace(value)
+	return strings.TrimSpace(value)
 }
 
 // parseNodesFromContent parses nodes from plain text content (one URI per line)
@@ -593,8 +827,7 @@ func isBase64(s string) bool {
 
 	// Base64 should not contain newlines in the middle (unless it's multi-line base64)
 	// and should only contain valid base64 characters
-	s = strings.ReplaceAll(s, "\n", "")
-	s = strings.ReplaceAll(s, "\r", "")
+	s = stripAllWhitespace(s)
 
 	// Check if it contains proxy URI schemes (then it's not base64)
 	if strings.Contains(s, "://") {
@@ -602,11 +835,81 @@ func isBase64(s string) bool {
 	}
 
 	// Try to decode
-	_, err := base64.StdEncoding.DecodeString(s)
+	_, err := decodeBase64Any(s)
 	if err != nil {
-		_, err = base64.RawStdEncoding.DecodeString(s)
+		return false
 	}
-	return err == nil
+	return true
+}
+
+func stripAllWhitespace(value string) string {
+	value = strings.ReplaceAll(value, "\n", "")
+	value = strings.ReplaceAll(value, "\r", "")
+	value = strings.ReplaceAll(value, "\t", "")
+	value = strings.ReplaceAll(value, " ", "")
+	return value
+}
+
+func decodeBase64Subscription(content string) (string, error) {
+	content = stripAllWhitespace(content)
+	decoded, err := decodeBase64Any(content)
+	if err != nil {
+		return "", err
+	}
+	return string(decoded), nil
+}
+
+func decodeBase64Any(value string) ([]byte, error) {
+	encodings := []*base64.Encoding{
+		base64.RawURLEncoding,
+		base64.URLEncoding,
+		base64.RawStdEncoding,
+		base64.StdEncoding,
+	}
+	var lastErr error
+	for _, enc := range encodings {
+		decoded, err := enc.DecodeString(value)
+		if err == nil {
+			return decoded, nil
+		}
+		lastErr = err
+	}
+	if lastErr == nil {
+		lastErr = errors.New("invalid base64")
+	}
+	return nil, lastErr
+}
+
+func looksLikeHTML(content string) bool {
+	lower := strings.ToLower(strings.TrimSpace(content))
+	if strings.HasPrefix(lower, "<!doctype") || strings.HasPrefix(lower, "<html") {
+		return true
+	}
+	// Some providers return an HTML login page without doctype.
+	if strings.Contains(lower, "<head") && strings.Contains(lower, "<body") {
+		return true
+	}
+	return false
+}
+
+type vmessJSONName struct {
+	PS string `json:"ps"`
+}
+
+func extractNameFromVMessURI(uri string) string {
+	encoded := strings.TrimSpace(strings.TrimPrefix(uri, "vmess://"))
+	if encoded == "" {
+		return ""
+	}
+	decoded, err := decodeBase64Any(encoded)
+	if err != nil {
+		return ""
+	}
+	var payload vmessJSONName
+	if err := json.Unmarshal(decoded, &payload); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(payload.PS)
 }
 
 // isProxyURI checks if a string is a valid proxy URI
@@ -626,27 +929,27 @@ type clashConfig struct {
 }
 
 type clashProxy struct {
-	Name           string                 `yaml:"name"`
-	Type           string                 `yaml:"type"`
-	Server         string                 `yaml:"server"`
-	Port           int                    `yaml:"port"`
-	UUID           string                 `yaml:"uuid"`
-	Password       string                 `yaml:"password"`
-	Cipher         string                 `yaml:"cipher"`
-	AlterId        int                    `yaml:"alterId"`
-	Network        string                 `yaml:"network"`
-	TLS            bool                   `yaml:"tls"`
-	SkipCertVerify bool                   `yaml:"skip-cert-verify"`
-	ServerName     string                 `yaml:"servername"`
-	SNI            string                 `yaml:"sni"`
-	Flow           string                 `yaml:"flow"`
-	UDP            bool                   `yaml:"udp"`
-	WSOpts         *clashWSOptions        `yaml:"ws-opts"`
-	GrpcOpts       *clashGrpcOptions      `yaml:"grpc-opts"`
-	RealityOpts    *clashRealityOptions   `yaml:"reality-opts"`
-	ClientFingerprint string              `yaml:"client-fingerprint"`
-	Plugin         string                 `yaml:"plugin"`
-	PluginOpts     map[string]interface{} `yaml:"plugin-opts"`
+	Name              string                 `yaml:"name"`
+	Type              string                 `yaml:"type"`
+	Server            string                 `yaml:"server"`
+	Port              int                    `yaml:"port"`
+	UUID              string                 `yaml:"uuid"`
+	Password          string                 `yaml:"password"`
+	Cipher            string                 `yaml:"cipher"`
+	AlterId           int                    `yaml:"alterId"`
+	Network           string                 `yaml:"network"`
+	TLS               bool                   `yaml:"tls"`
+	SkipCertVerify    bool                   `yaml:"skip-cert-verify"`
+	ServerName        string                 `yaml:"servername"`
+	SNI               string                 `yaml:"sni"`
+	Flow              string                 `yaml:"flow"`
+	UDP               bool                   `yaml:"udp"`
+	WSOpts            *clashWSOptions        `yaml:"ws-opts"`
+	GrpcOpts          *clashGrpcOptions      `yaml:"grpc-opts"`
+	RealityOpts       *clashRealityOptions   `yaml:"reality-opts"`
+	ClientFingerprint string                 `yaml:"client-fingerprint"`
+	Plugin            string                 `yaml:"plugin"`
+	PluginOpts        map[string]interface{} `yaml:"plugin-opts"`
 }
 
 type clashWSOptions struct {
@@ -949,7 +1252,7 @@ func (c *Config) Save() error {
 	return c.SaveNodes()
 }
 
-// SaveSettings persists only config settings (external_ip, probe_target, skip_cert_verify)
+// SaveSettings persists only config settings (external_ip, probe_target, skip_cert_verify, subscriptions, subscription_refresh, node_filter)
 // without touching nodes.txt. Use this for settings API updates.
 func (c *Config) SaveSettings() error {
 	if c == nil {
@@ -971,6 +1274,9 @@ func (c *Config) SaveSettings() error {
 	saveCfg.ExternalIP = c.ExternalIP
 	saveCfg.Management.ProbeTarget = c.Management.ProbeTarget
 	saveCfg.SkipCertVerify = c.SkipCertVerify
+	saveCfg.Subscriptions = c.Subscriptions
+	saveCfg.SubscriptionRefresh = c.SubscriptionRefresh
+	saveCfg.NodeFilter = c.NodeFilter
 
 	newData, err := yaml.Marshal(&saveCfg)
 	if err != nil {

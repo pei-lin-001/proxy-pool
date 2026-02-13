@@ -6,10 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"easy_proxies/internal/config"
 	poolout "easy_proxies/internal/outbound/pool"
@@ -22,13 +24,21 @@ import (
 
 // Build converts high level config into sing-box Options tree.
 func Build(cfg *config.Config) (option.Options, error) {
-	baseOutbounds := make([]option.Outbound, 0, len(cfg.Nodes))
-	memberTags := make([]string, 0, len(cfg.Nodes))
+	selectedNodes := cfg.FilterNodes()
+	if len(selectedNodes) == 0 {
+		return option.Options{}, fmt.Errorf("no nodes matched node_filter")
+	}
+	if filtered := len(cfg.Nodes) - len(selectedNodes); filtered > 0 {
+		log.Printf("🔎 Node filter applied: %d/%d nodes enabled", len(selectedNodes), len(cfg.Nodes))
+	}
+
+	baseOutbounds := make([]option.Outbound, 0, len(selectedNodes))
+	memberTags := make([]string, 0, len(selectedNodes))
 	metadata := make(map[string]poolout.MemberMeta)
 	var failedNodes []string
 	usedTags := make(map[string]int) // Track tag usage for uniqueness
 
-	for _, node := range cfg.Nodes {
+	for _, node := range selectedNodes {
 		baseTag := sanitizeTag(node.Name)
 		if baseTag == "" {
 			baseTag = fmt.Sprintf("node-%d", len(memberTags)+1)
@@ -43,7 +53,7 @@ func Build(cfg *config.Config) (option.Options, error) {
 			usedTags[baseTag] = 1
 		}
 
-		outbound, err := buildNodeOutbound(tag, node.URI, cfg.SkipCertVerify)
+		outbound, err := buildNodeOutbound(tag, node.URI, cfg.SkipCertVerify, cfg.ConnectTimeout)
 		if err != nil {
 			log.Printf("❌ Failed to build node '%s': %v (skipping)", node.Name, err)
 			failedNodes = append(failedNodes, node.Name)
@@ -55,6 +65,7 @@ func Build(cfg *config.Config) (option.Options, error) {
 			Name: node.Name,
 			URI:  node.URI,
 			Mode: cfg.Mode,
+			Geo:  node.Geo,
 		}
 		// For multi-port and hybrid modes, use per-node port
 		if cfg.Mode == "multi-port" || cfg.Mode == "hybrid" {
@@ -69,14 +80,14 @@ func Build(cfg *config.Config) (option.Options, error) {
 
 	// Check if we have at least one valid node
 	if len(baseOutbounds) == 0 {
-		return option.Options{}, fmt.Errorf("no valid nodes available (all %d nodes failed to build)", len(cfg.Nodes))
+		return option.Options{}, fmt.Errorf("no valid nodes available (all %d enabled nodes failed to build)", len(selectedNodes))
 	}
 
 	// Log summary
 	if len(failedNodes) > 0 {
-		log.Printf("⚠️  %d/%d nodes failed and were skipped: %v", len(failedNodes), len(cfg.Nodes), failedNodes)
+		log.Printf("⚠️  %d/%d nodes failed and were skipped: %v", len(failedNodes), len(selectedNodes), failedNodes)
 	}
-	log.Printf("✅ Successfully built %d/%d nodes", len(baseOutbounds), len(cfg.Nodes))
+	log.Printf("✅ Successfully built %d/%d nodes", len(baseOutbounds), len(selectedNodes))
 
 	// Print proxy links for each node
 	printProxyLinks(cfg, metadata)
@@ -209,7 +220,7 @@ func buildPoolInbound(cfg *config.Config) (option.Inbound, error) {
 	return inbound, nil
 }
 
-func buildNodeOutbound(tag, rawURI string, skipCertVerify bool) (option.Outbound, error) {
+func buildNodeOutbound(tag, rawURI string, skipCertVerify bool, connectTimeout time.Duration) (option.Outbound, error) {
 	parsed, err := url.Parse(rawURI)
 	if err != nil {
 		return option.Outbound{}, fmt.Errorf("parse uri: %w", err)
@@ -220,11 +231,17 @@ func buildNodeOutbound(tag, rawURI string, skipCertVerify bool) (option.Outbound
 		if err != nil {
 			return option.Outbound{}, err
 		}
+		if connectTimeout > 0 && opts.ConnectTimeout == 0 {
+			opts.ConnectTimeout = badoption.Duration(connectTimeout)
+		}
 		return option.Outbound{Type: C.TypeVLESS, Tag: tag, Options: &opts}, nil
 	case "hysteria2":
 		opts, err := buildHysteria2Options(parsed, skipCertVerify)
 		if err != nil {
 			return option.Outbound{}, err
+		}
+		if connectTimeout > 0 && opts.ConnectTimeout == 0 {
+			opts.ConnectTimeout = badoption.Duration(connectTimeout)
 		}
 		return option.Outbound{Type: C.TypeHysteria2, Tag: tag, Options: &opts}, nil
 	case "ss", "shadowsocks":
@@ -232,17 +249,26 @@ func buildNodeOutbound(tag, rawURI string, skipCertVerify bool) (option.Outbound
 		if err != nil {
 			return option.Outbound{}, err
 		}
+		if connectTimeout > 0 && opts.ConnectTimeout == 0 {
+			opts.ConnectTimeout = badoption.Duration(connectTimeout)
+		}
 		return option.Outbound{Type: C.TypeShadowsocks, Tag: tag, Options: &opts}, nil
 	case "trojan":
 		opts, err := buildTrojanOptions(parsed, skipCertVerify)
 		if err != nil {
 			return option.Outbound{}, err
 		}
+		if connectTimeout > 0 && opts.ConnectTimeout == 0 {
+			opts.ConnectTimeout = badoption.Duration(connectTimeout)
+		}
 		return option.Outbound{Type: C.TypeTrojan, Tag: tag, Options: &opts}, nil
 	case "vmess":
 		opts, err := buildVMessOptions(rawURI, skipCertVerify)
 		if err != nil {
 			return option.Outbound{}, err
+		}
+		if connectTimeout > 0 && opts.ConnectTimeout == 0 {
+			opts.ConnectTimeout = badoption.Duration(connectTimeout)
 		}
 		return option.Outbound{Type: C.TypeVMess, Tag: tag, Options: &opts}, nil
 	default:
@@ -251,15 +277,18 @@ func buildNodeOutbound(tag, rawURI string, skipCertVerify bool) (option.Outbound
 }
 
 func buildVLESSOptions(u *url.URL, skipCertVerify bool) (option.VLESSOutboundOptions, error) {
-	uuid := u.User.Username()
-	if uuid == "" {
-		return option.VLESSOutboundOptions{}, errors.New("vless uri missing uuid in userinfo")
+	if u.User == nil {
+		return option.VLESSOutboundOptions{}, errors.New("vless uri missing userinfo")
 	}
 	server, port, err := hostPort(u, 443)
 	if err != nil {
 		return option.VLESSOutboundOptions{}, err
 	}
 	query := u.Query()
+	uuid, err := extractVLESSUUID(u)
+	if err != nil {
+		return option.VLESSOutboundOptions{}, err
+	}
 	opts := option.VLESSOutboundOptions{
 		UUID:          uuid,
 		ServerOptions: option.ServerOptions{Server: server, ServerPort: uint16(port)},
@@ -267,9 +296,19 @@ func buildVLESSOptions(u *url.URL, skipCertVerify bool) (option.VLESSOutboundOpt
 	}
 	if flow := query.Get("flow"); flow != "" {
 		opts.Flow = flow
+	} else if xtls := strings.TrimSpace(query.Get("xtls")); xtls != "" {
+		// Shadowrocket style: xtls=2 means vision.
+		if xtls == "2" {
+			opts.Flow = "xtls-rprx-vision"
+		} else if xtls == "1" {
+			opts.Flow = "xtls-rprx-origin"
+		}
 	}
 	if packetEncoding := query.Get("packetEncoding"); packetEncoding != "" {
 		opts.PacketEncoding = &packetEncoding
+	}
+	if tfo := strings.TrimSpace(query.Get("tfo")); tfo != "" {
+		opts.TCPFastOpen = parseBool01(tfo)
 	}
 	if transport, err := buildV2RayTransport(query); err != nil {
 		return option.VLESSOutboundOptions{}, err
@@ -285,7 +324,13 @@ func buildVLESSOptions(u *url.URL, skipCertVerify bool) (option.VLESSOutboundOpt
 }
 
 func buildHysteria2Options(u *url.URL, skipCertVerify bool) (option.Hysteria2OutboundOptions, error) {
+	if u.User == nil {
+		return option.Hysteria2OutboundOptions{}, errors.New("hysteria2 uri missing userinfo")
+	}
 	password := u.User.String()
+	if password == "" {
+		return option.Hysteria2OutboundOptions{}, errors.New("hysteria2 uri missing password in userinfo")
+	}
 	server, port, err := hostPort(u, 443)
 	if err != nil {
 		return option.Hysteria2OutboundOptions{}, err
@@ -331,13 +376,29 @@ func hysteriaTLSOptions(host string, query url.Values, skipCertVerify bool) *opt
 }
 
 func buildTLSOptions(query url.Values, skipCertVerify bool) (*option.OutboundTLSOptions, error) {
-	security := strings.ToLower(query.Get("security"))
+	security := strings.ToLower(strings.TrimSpace(query.Get("security")))
+	if security == "" {
+		// Shadowrocket style: tls=1, peer=..., pbk/sid for reality.
+		if parseBool01(query.Get("tls")) {
+			if query.Get("pbk") != "" || query.Get("sid") != "" {
+				security = "reality"
+			} else {
+				security = "tls"
+			}
+		}
+	}
 	if security == "" || security == "none" {
 		return nil, nil
 	}
 	tlsOptions := &option.OutboundTLSOptions{Enabled: true, Insecure: skipCertVerify}
 	if sni := query.Get("sni"); sni != "" {
 		tlsOptions.ServerName = sni
+	}
+	if peer := query.Get("peer"); peer != "" && tlsOptions.ServerName == "" {
+		tlsOptions.ServerName = peer
+	}
+	if serverName := query.Get("servername"); serverName != "" && tlsOptions.ServerName == "" {
+		tlsOptions.ServerName = serverName
 	}
 	insecure := query.Get("allowInsecure")
 	if insecure == "" {
@@ -364,6 +425,133 @@ func buildTLSOptions(query url.Values, skipCertVerify bool) (*option.OutboundTLS
 		}
 	}
 	return tlsOptions, nil
+}
+
+func extractVLESSUUID(u *url.URL) (string, error) {
+	if u == nil || u.User == nil {
+		return "", errors.New("vless uri missing userinfo")
+	}
+	raw := strings.TrimSpace(u.User.Username())
+	if raw == "" {
+		return "", errors.New("vless uri missing uuid in userinfo")
+	}
+	if normalized := normalizeUUID(raw); normalized != "" {
+		return normalized, nil
+	}
+
+	// Shadowrocket style: userinfo is base64 ("none:uuid@host:port").
+	decoded, err := decodeBase64Any(raw)
+	if err != nil {
+		return "", fmt.Errorf("vless invalid uuid %q", raw)
+	}
+	if extracted := extractUUIDFromText(string(decoded)); extracted != "" {
+		return extracted, nil
+	}
+	return "", fmt.Errorf("vless invalid uuid %q", raw)
+}
+
+func parseBool01(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	if value == "1" {
+		return true
+	}
+	if value == "0" {
+		return false
+	}
+	return strings.EqualFold(value, "true") || strings.EqualFold(value, "yes") || strings.EqualFold(value, "on")
+}
+
+func normalizeUUID(value string) string {
+	value = strings.TrimSpace(value)
+	if isUUID36(value) {
+		return strings.ToLower(value)
+	}
+	if isUUID32(value) {
+		value = strings.ToLower(value)
+		return value[0:8] + "-" + value[8:12] + "-" + value[12:16] + "-" + value[16:20] + "-" + value[20:32]
+	}
+	return ""
+}
+
+func isUUID36(value string) bool {
+	if len(value) != 36 {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		switch i {
+		case 8, 13, 18, 23:
+			if c != '-' {
+				return false
+			}
+		default:
+			if !isHexByte(c) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func isUUID32(value string) bool {
+	if len(value) != 32 {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		if !isHexByte(value[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func isHexByte(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+}
+
+func decodeBase64Any(value string) ([]byte, error) {
+	value = strings.TrimSpace(value)
+	value = strings.ReplaceAll(value, "\n", "")
+	value = strings.ReplaceAll(value, "\r", "")
+	if value == "" {
+		return nil, errors.New("empty base64")
+	}
+	encodings := []*base64.Encoding{
+		base64.RawURLEncoding,
+		base64.URLEncoding,
+		base64.RawStdEncoding,
+		base64.StdEncoding,
+	}
+	var lastErr error
+	for _, enc := range encodings {
+		decoded, err := enc.DecodeString(value)
+		if err == nil {
+			return decoded, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+func extractUUIDFromText(text string) string {
+	// Prefer canonical 36-char UUID with dashes.
+	for i := 0; i+36 <= len(text); i++ {
+		cand := text[i : i+36]
+		if normalized := normalizeUUID(cand); normalized != "" {
+			return normalized
+		}
+	}
+	// Also accept 32-char hex UUID (no dashes).
+	for i := 0; i+32 <= len(text); i++ {
+		cand := text[i : i+32]
+		if normalized := normalizeUUID(cand); normalized != "" {
+			return normalized
+		}
+	}
+	return ""
 }
 
 func buildV2RayTransport(query url.Values) (*option.V2RayTransportOptions, error) {
@@ -423,7 +611,13 @@ func buildShadowsocksOptions(u *url.URL) (option.ShadowsocksOutboundOptions, err
 	}
 
 	// Decode userinfo (base64 encoded method:password)
+	if u.User == nil {
+		return option.ShadowsocksOutboundOptions{}, errors.New("shadowsocks uri missing userinfo")
+	}
 	userInfo := u.User.String()
+	if userInfo == "" {
+		return option.ShadowsocksOutboundOptions{}, errors.New("shadowsocks uri missing userinfo")
+	}
 	decoded, err := base64.RawURLEncoding.DecodeString(userInfo)
 	if err != nil {
 		// Try standard base64
@@ -457,6 +651,9 @@ func buildShadowsocksOptions(u *url.URL) (option.ShadowsocksOutboundOptions, err
 }
 
 func buildTrojanOptions(u *url.URL, skipCertVerify bool) (option.TrojanOutboundOptions, error) {
+	if u.User == nil {
+		return option.TrojanOutboundOptions{}, errors.New("trojan uri missing userinfo")
+	}
 	password := u.User.Username()
 	if password == "" {
 		return option.TrojanOutboundOptions{}, errors.New("trojan uri missing password in userinfo")
@@ -792,9 +989,14 @@ func printProxyLinks(cfg *config.Config, metadata map[string]poolout.MemberMeta)
 		if cfg.Listener.Username != "" {
 			auth = fmt.Sprintf("%s:%s@", cfg.Listener.Username, cfg.Listener.Password)
 		}
-		proxyURL := fmt.Sprintf("http://%s%s:%d", auth, cfg.Listener.Address, cfg.Listener.Port)
 		log.Printf("🌐 Pool Entry Point:")
-		log.Printf("   %s", proxyURL)
+		for _, host := range proxyDisplayHosts(cfg.Listener.Address, cfg.ExternalIP) {
+			proxyURL := fmt.Sprintf("http://%s%s:%d", auth, host, cfg.Listener.Port)
+			log.Printf("   %s", proxyURL)
+		}
+		if (cfg.Listener.Address == "0.0.0.0" || cfg.Listener.Address == "::") && strings.TrimSpace(cfg.ExternalIP) == "" {
+			log.Printf("   (tip) 0.0.0.0 is not a usable client address; set external_ip to print a public/LAN address")
+		}
 		log.Println("")
 		log.Printf("   Nodes in pool (%d):", len(metadata))
 		for _, meta := range metadata {
@@ -809,6 +1011,14 @@ func printProxyLinks(cfg *config.Config, metadata map[string]poolout.MemberMeta)
 		// Multi-port mode: each node has its own port
 		log.Printf("🔌 Multi-Port Entry Points (%d nodes):", len(cfg.Nodes))
 		log.Println("")
+		multiHosts := proxyDisplayHosts(cfg.MultiPort.Address, cfg.ExternalIP)
+		multiHost := ""
+		if len(multiHosts) > 0 {
+			multiHost = multiHosts[0]
+		}
+		if (cfg.MultiPort.Address == "0.0.0.0" || cfg.MultiPort.Address == "::") && strings.TrimSpace(cfg.ExternalIP) == "" {
+			log.Printf("   (tip) set external_ip for a stable address; using %q for display", multiHost)
+		}
 		for _, node := range cfg.Nodes {
 			var auth string
 			username := node.Username
@@ -820,12 +1030,89 @@ func printProxyLinks(cfg *config.Config, metadata map[string]poolout.MemberMeta)
 			if username != "" {
 				auth = fmt.Sprintf("%s:%s@", username, password)
 			}
-			proxyURL := fmt.Sprintf("http://%s%s:%d", auth, cfg.MultiPort.Address, node.Port)
 			log.Printf("   [%d] %s", node.Port, node.Name)
-			log.Printf("       %s", proxyURL)
+			if multiHost != "" {
+				proxyURL := fmt.Sprintf("http://%s%s:%d", auth, multiHost, node.Port)
+				log.Printf("       %s", proxyURL)
+			} else {
+				log.Printf("       (no usable listen address)")
+			}
 		}
 	}
 
 	log.Println("═══════════════════════════════════════════════════════════════")
 	log.Println("")
+}
+
+func proxyDisplayHosts(listenAddr string, externalIP string) []string {
+	listenAddr = strings.TrimSpace(listenAddr)
+	externalIP = strings.TrimSpace(externalIP)
+
+	if listenAddr == "" {
+		listenAddr = "0.0.0.0"
+	}
+
+	// If binding to a specific address, only print that (do not guess).
+	if listenAddr != "0.0.0.0" && listenAddr != "::" {
+		return []string{listenAddr}
+	}
+
+	hosts := make([]string, 0, 8)
+	seen := make(map[string]struct{}, 8)
+	add := func(h string) {
+		h = strings.TrimSpace(h)
+		if h == "" {
+			return
+		}
+		if _, ok := seen[h]; ok {
+			return
+		}
+		seen[h] = struct{}{}
+		hosts = append(hosts, h)
+	}
+
+	if externalIP != "" {
+		add(externalIP)
+	}
+	add("127.0.0.1")
+
+	ifaces, err := net.Interfaces()
+	if err == nil {
+		for _, iface := range ifaces {
+			if iface.Flags&net.FlagUp == 0 {
+				continue
+			}
+			if iface.Flags&net.FlagLoopback != 0 {
+				continue
+			}
+			addrs, err := iface.Addrs()
+			if err != nil {
+				continue
+			}
+			for _, addr := range addrs {
+				ip, _, err := net.ParseCIDR(addr.String())
+				if err != nil || ip == nil {
+					continue
+				}
+				if ip.IsLoopback() {
+					continue
+				}
+				v4 := ip.To4()
+				if v4 == nil {
+					continue
+				}
+				// Skip link-local IPv4 (169.254.0.0/16)
+				if v4[0] == 169 && v4[1] == 254 {
+					continue
+				}
+				add(v4.String())
+				// Avoid printing too many candidates.
+				if len(hosts) >= 6 {
+					return hosts
+				}
+			}
+		}
+	}
+
+	return hosts
 }

@@ -9,8 +9,10 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -41,6 +43,7 @@ var (
 type SubscriptionRefresher interface {
 	RefreshNow() error
 	Status() SubscriptionStatus
+	UpdateSettings(subscriptions []string, refreshCfg config.SubscriptionRefreshConfig)
 }
 
 // SubscriptionStatus represents subscription refresh status.
@@ -86,6 +89,7 @@ func NewServer(cfg Config, mgr *Manager, logger *log.Logger) *Server {
 	mux.HandleFunc("/", s.handleIndex)
 	mux.HandleFunc("/api/auth", s.handleAuth)
 	mux.HandleFunc("/api/settings", s.withAuth(s.handleSettings))
+	mux.HandleFunc("/api/geo/options", s.withAuth(s.handleGeoOptions))
 	mux.HandleFunc("/api/nodes", s.withAuth(s.handleNodes))
 	mux.HandleFunc("/api/nodes/config", s.withAuth(s.handleConfigNodes))
 	mux.HandleFunc("/api/nodes/config/", s.withAuth(s.handleConfigNodeItem))
@@ -129,34 +133,280 @@ func (s *Server) SetConfig(cfg *config.Config) {
 	}
 }
 
-// getSettings returns current dynamic settings (thread-safe).
-func (s *Server) getSettings() (externalIP, probeTarget string, skipCertVerify bool) {
-	s.cfgMu.RLock()
-	defer s.cfgMu.RUnlock()
-	return s.cfg.ExternalIP, s.cfg.ProbeTarget, s.cfg.SkipCertVerify
+type settingsSnapshot struct {
+	ExternalIP          string                  `json:"external_ip"`
+	ProbeTarget         string                  `json:"probe_target"`
+	SkipCertVerify      bool                    `json:"skip_cert_verify"`
+	Subscriptions       []string                `json:"subscriptions"`
+	SubscriptionRefresh subscriptionRefreshView `json:"subscription_refresh"`
+	NodeFilter          config.NodeFilterConfig `json:"node_filter"`
 }
 
-// updateSettings updates dynamic settings and persists to config file.
-func (s *Server) updateSettings(externalIP, probeTarget string, skipCertVerify bool) error {
+type subscriptionRefreshView struct {
+	Enabled            bool   `json:"enabled"`
+	Interval           string `json:"interval"`
+	Timeout            string `json:"timeout"`
+	HealthCheckTimeout string `json:"health_check_timeout"`
+	DrainTimeout       string `json:"drain_timeout"`
+	MinAvailableNodes  int    `json:"min_available_nodes"`
+}
+
+func (s *Server) getSettingsSnapshot() settingsSnapshot {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+
+	snap := settingsSnapshot{
+		ExternalIP:     s.cfg.ExternalIP,
+		ProbeTarget:    s.cfg.ProbeTarget,
+		SkipCertVerify: s.cfg.SkipCertVerify,
+		Subscriptions:  make([]string, 0),
+	}
+	if s.cfgSrc == nil {
+		return snap
+	}
+	snap.ExternalIP = s.cfgSrc.ExternalIP
+	snap.ProbeTarget = s.cfgSrc.Management.ProbeTarget
+	snap.SkipCertVerify = s.cfgSrc.SkipCertVerify
+	snap.Subscriptions = make([]string, 0, len(s.cfgSrc.Subscriptions))
+	snap.Subscriptions = append(snap.Subscriptions, s.cfgSrc.Subscriptions...)
+	snap.NodeFilter = s.cfgSrc.NodeFilter
+	snap.SubscriptionRefresh = subscriptionRefreshView{
+		Enabled:            s.cfgSrc.SubscriptionRefresh.Enabled,
+		Interval:           s.cfgSrc.SubscriptionRefresh.Interval.String(),
+		Timeout:            s.cfgSrc.SubscriptionRefresh.Timeout.String(),
+		HealthCheckTimeout: s.cfgSrc.SubscriptionRefresh.HealthCheckTimeout.String(),
+		DrainTimeout:       s.cfgSrc.SubscriptionRefresh.DrainTimeout.String(),
+		MinAvailableNodes:  s.cfgSrc.SubscriptionRefresh.MinAvailableNodes,
+	}
+	return snap
+}
+
+type settingsUpdate struct {
+	ExternalIP     *string `json:"external_ip"`
+	ProbeTarget    *string `json:"probe_target"`
+	SkipCertVerify *bool   `json:"skip_cert_verify"`
+
+	Subscriptions *[]string `json:"subscriptions"`
+
+	SubscriptionRefresh *struct {
+		Enabled            *bool   `json:"enabled"`
+		Interval           *string `json:"interval"`
+		Timeout            *string `json:"timeout"`
+		HealthCheckTimeout *string `json:"health_check_timeout"`
+		DrainTimeout       *string `json:"drain_timeout"`
+		MinAvailableNodes  *int    `json:"min_available_nodes"`
+	} `json:"subscription_refresh"`
+
+	NodeFilter *struct {
+		Target   *string   `json:"target"`
+		Include  *[]string `json:"include"`
+		Exclude  *[]string `json:"exclude"`
+		UseRegex *bool     `json:"use_regex"`
+	} `json:"node_filter"`
+}
+
+type httpError struct {
+	status  int
+	message string
+}
+
+func (e httpError) Error() string { return e.message }
+
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func normalizeStringList(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, v := range in {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			continue
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
+// updateSettings applies a partial update, persists to config file, and returns whether reload is needed.
+func (s *Server) updateSettings(update settingsUpdate) (needReload bool, err error) {
+	var (
+		shouldUpdateProbeTarget     bool
+		newProbeTarget              string
+		subscriptionSettingsChanged bool
+	)
+
 	s.cfgMu.Lock()
 	defer s.cfgMu.Unlock()
 
-	s.cfg.ExternalIP = externalIP
-	s.cfg.ProbeTarget = probeTarget
-	s.cfg.SkipCertVerify = skipCertVerify
-
 	if s.cfgSrc == nil {
-		return errors.New("配置存储未初始化")
+		return false, httpError{status: http.StatusInternalServerError, message: "配置存储未初始化"}
 	}
 
-	s.cfgSrc.ExternalIP = externalIP
-	s.cfgSrc.Management.ProbeTarget = probeTarget
-	s.cfgSrc.SkipCertVerify = skipCertVerify
+	// Backup for rollback on save failure
+	prevExternalIP := s.cfgSrc.ExternalIP
+	prevProbeTarget := s.cfgSrc.Management.ProbeTarget
+	prevSkip := s.cfgSrc.SkipCertVerify
+	prevSubs := append([]string(nil), s.cfgSrc.Subscriptions...)
+	prevRefresh := s.cfgSrc.SubscriptionRefresh
+	prevFilter := s.cfgSrc.NodeFilter
 
-	if err := s.cfgSrc.SaveSettings(); err != nil {
-		return fmt.Errorf("保存配置失败: %w", err)
+	// Apply updates
+	if update.ExternalIP != nil {
+		s.cfgSrc.ExternalIP = strings.TrimSpace(*update.ExternalIP)
+		s.cfg.ExternalIP = s.cfgSrc.ExternalIP
 	}
-	return nil
+	if update.ProbeTarget != nil {
+		newProbeTarget = strings.TrimSpace(*update.ProbeTarget)
+		s.cfgSrc.Management.ProbeTarget = newProbeTarget
+		s.cfg.ProbeTarget = newProbeTarget
+		shouldUpdateProbeTarget = true
+	}
+	if update.SkipCertVerify != nil {
+		next := *update.SkipCertVerify
+		if next != prevSkip {
+			needReload = true
+		}
+		s.cfgSrc.SkipCertVerify = next
+		s.cfg.SkipCertVerify = s.cfgSrc.SkipCertVerify
+	}
+
+	if update.Subscriptions != nil {
+		subscriptionSettingsChanged = true
+		unique := make(map[string]struct{})
+		subs := make([]string, 0, len(*update.Subscriptions))
+		for _, raw := range *update.Subscriptions {
+			raw = config.NormalizeSubscriptionURL(raw)
+			if raw == "" {
+				continue
+			}
+			if _, ok := unique[raw]; ok {
+				continue
+			}
+			unique[raw] = struct{}{}
+			subs = append(subs, raw)
+		}
+		s.cfgSrc.Subscriptions = subs
+	}
+
+	if update.SubscriptionRefresh != nil {
+		subscriptionSettingsChanged = true
+		if update.SubscriptionRefresh.Enabled != nil {
+			next := *update.SubscriptionRefresh.Enabled
+			s.cfgSrc.SubscriptionRefresh.Enabled = next
+		}
+		if update.SubscriptionRefresh.Interval != nil {
+			d, parseErr := time.ParseDuration(strings.TrimSpace(*update.SubscriptionRefresh.Interval))
+			if parseErr != nil {
+				return false, httpError{status: http.StatusBadRequest, message: fmt.Sprintf("无效 interval: %v", parseErr)}
+			}
+			s.cfgSrc.SubscriptionRefresh.Interval = d
+		}
+		if update.SubscriptionRefresh.Timeout != nil {
+			d, parseErr := time.ParseDuration(strings.TrimSpace(*update.SubscriptionRefresh.Timeout))
+			if parseErr != nil {
+				return false, httpError{status: http.StatusBadRequest, message: fmt.Sprintf("无效 timeout: %v", parseErr)}
+			}
+			s.cfgSrc.SubscriptionRefresh.Timeout = d
+		}
+		if update.SubscriptionRefresh.HealthCheckTimeout != nil {
+			d, parseErr := time.ParseDuration(strings.TrimSpace(*update.SubscriptionRefresh.HealthCheckTimeout))
+			if parseErr != nil {
+				return false, httpError{status: http.StatusBadRequest, message: fmt.Sprintf("无效 health_check_timeout: %v", parseErr)}
+			}
+			s.cfgSrc.SubscriptionRefresh.HealthCheckTimeout = d
+		}
+		if update.SubscriptionRefresh.DrainTimeout != nil {
+			d, parseErr := time.ParseDuration(strings.TrimSpace(*update.SubscriptionRefresh.DrainTimeout))
+			if parseErr != nil {
+				return false, httpError{status: http.StatusBadRequest, message: fmt.Sprintf("无效 drain_timeout: %v", parseErr)}
+			}
+			s.cfgSrc.SubscriptionRefresh.DrainTimeout = d
+		}
+		if update.SubscriptionRefresh.MinAvailableNodes != nil {
+			next := *update.SubscriptionRefresh.MinAvailableNodes
+			s.cfgSrc.SubscriptionRefresh.MinAvailableNodes = next
+		}
+	}
+
+	if update.NodeFilter != nil {
+		if update.NodeFilter.Target != nil {
+			next := strings.ToLower(strings.TrimSpace(*update.NodeFilter.Target))
+			if next == "" {
+				next = "name"
+			}
+			switch next {
+			case "name", "geo", "name_or_geo":
+			default:
+				return false, httpError{status: http.StatusBadRequest, message: "node_filter.target 只能是 name / geo / name_or_geo"}
+			}
+			prevTarget := strings.ToLower(strings.TrimSpace(prevFilter.Target))
+			if prevTarget == "" {
+				prevTarget = "name"
+			}
+			if next != prevTarget {
+				needReload = true
+			}
+			s.cfgSrc.NodeFilter.Target = next
+		}
+		if update.NodeFilter.Include != nil {
+			next := normalizeStringList(*update.NodeFilter.Include)
+			if !equalStringSlices(next, prevFilter.Include) {
+				needReload = true
+			}
+			s.cfgSrc.NodeFilter.Include = next
+		}
+		if update.NodeFilter.Exclude != nil {
+			next := normalizeStringList(*update.NodeFilter.Exclude)
+			if !equalStringSlices(next, prevFilter.Exclude) {
+				needReload = true
+			}
+			s.cfgSrc.NodeFilter.Exclude = next
+		}
+		if update.NodeFilter.UseRegex != nil {
+			next := *update.NodeFilter.UseRegex
+			if next != prevFilter.UseRegex {
+				needReload = true
+			}
+			s.cfgSrc.NodeFilter.UseRegex = next
+		}
+	}
+
+	// Persist changes
+	if saveErr := s.cfgSrc.SaveSettings(); saveErr != nil {
+		// Rollback
+		s.cfgSrc.ExternalIP = prevExternalIP
+		s.cfgSrc.Management.ProbeTarget = prevProbeTarget
+		s.cfgSrc.SkipCertVerify = prevSkip
+		s.cfgSrc.Subscriptions = prevSubs
+		s.cfgSrc.SubscriptionRefresh = prevRefresh
+		s.cfgSrc.NodeFilter = prevFilter
+
+		s.cfg.ExternalIP = prevExternalIP
+		s.cfg.ProbeTarget = prevProbeTarget
+		s.cfg.SkipCertVerify = prevSkip
+
+		return false, httpError{status: http.StatusInternalServerError, message: fmt.Sprintf("保存配置失败: %v", saveErr)}
+	}
+
+	if subscriptionSettingsChanged && s.subRefresher != nil {
+		s.subRefresher.UpdateSettings(s.cfgSrc.Subscriptions, s.cfgSrc.SubscriptionRefresh)
+	}
+
+	// Apply probe target to monitor manager immediately (no reload needed).
+	if shouldUpdateProbeTarget && s.mgr != nil {
+		s.mgr.SetProbeTarget(newProbeTarget)
+	}
+
+	return needReload, nil
 }
 
 // Start launches the HTTP server.
@@ -203,8 +453,9 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	// 只返回初始检查通过的可用节点
-	payload := map[string]any{"nodes": s.mgr.SnapshotFiltered(true)}
+	// 返回所有节点（包含不可用节点），避免“节点已加载但全部探测失败”时前端误判为“没有节点”。
+	// 前端会根据 failure_count / blacklisted 展示状态；导出接口仍只导出可用节点。
+	payload := map[string]any{"nodes": s.mgr.SnapshotFiltered(false)}
 	writeJSON(w, payload)
 }
 
@@ -268,7 +519,9 @@ func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		// Some nodes (especially with Reality/XTLS) can take longer to complete handshake on poor networks.
+		// Use a slightly longer timeout for manual probe to reduce false negatives.
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
 		latency, err := s.mgr.Probe(ctx, tag)
 		if err != nil {
@@ -488,6 +741,8 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	snapshots := s.mgr.SnapshotFiltered(true)
 	var lines []string
 
+	settings := s.getSettingsSnapshot()
+	requestHost := extractHost(r)
 	for _, snap := range snapshots {
 		// 只导出有监听地址和端口的节点
 		if snap.ListenAddress == "" || snap.Port == 0 {
@@ -498,8 +753,12 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 		// 在 pool 模式下，所有节点共享同一端口，也正常导出
 		listenAddr := snap.ListenAddress
 		if listenAddr == "0.0.0.0" || listenAddr == "::" {
-			if extIP, _, _ := s.getSettings(); extIP != "" {
-				listenAddr = extIP
+			if settings.ExternalIP != "" {
+				listenAddr = settings.ExternalIP
+			} else if requestHost != "" {
+				// When listening on all interfaces, exporting 0.0.0.0 is not usable.
+				// Prefer the host that the user used to access the WebUI.
+				listenAddr = requestHost
 			}
 		}
 
@@ -520,47 +779,192 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(strings.Join(lines, "\n")))
 }
 
+func extractHost(r *http.Request) string {
+	if r == nil {
+		return ""
+	}
+	host := strings.TrimSpace(r.Host)
+	if host == "" {
+		return ""
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return ""
+	}
+	if host == "0.0.0.0" || host == "::" {
+		return ""
+	}
+	return host
+}
+
 // handleSettings handles GET/PUT for dynamic settings (external_ip, probe_target, skip_cert_verify).
 func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		extIP, probeTarget, skipCertVerify := s.getSettings()
-		writeJSON(w, map[string]any{
-			"external_ip":      extIP,
-			"probe_target":     probeTarget,
-			"skip_cert_verify": skipCertVerify,
-		})
+		writeJSON(w, s.getSettingsSnapshot())
 	case http.MethodPut:
-		var req struct {
-			ExternalIP     string `json:"external_ip"`
-			ProbeTarget    string `json:"probe_target"`
-			SkipCertVerify bool   `json:"skip_cert_verify"`
-		}
+		var req settingsUpdate
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			writeJSON(w, map[string]any{"error": "请求格式错误"})
 			return
 		}
-
-		extIP := strings.TrimSpace(req.ExternalIP)
-		probeTarget := strings.TrimSpace(req.ProbeTarget)
-
-		if err := s.updateSettings(extIP, probeTarget, req.SkipCertVerify); err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
+		needReload, err := s.updateSettings(req)
+		if err != nil {
+			status := http.StatusInternalServerError
+			var he httpError
+			if errors.As(err, &he) && he.status != 0 {
+				status = he.status
+			}
+			w.WriteHeader(status)
 			writeJSON(w, map[string]any{"error": err.Error()})
 			return
 		}
 
+		snap := s.getSettingsSnapshot()
 		writeJSON(w, map[string]any{
-			"message":          "设置已保存",
-			"external_ip":      extIP,
-			"probe_target":     probeTarget,
-			"skip_cert_verify": req.SkipCertVerify,
-			"need_reload":      true,
+			"message":     "设置已保存",
+			"settings":    snap,
+			"need_reload": needReload,
 		})
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+type geoOption struct {
+	Value string `json:"value"`
+	Label string `json:"label"`
+	Count int    `json:"count"`
+}
+
+type geoOptionsResponse struct {
+	TotalNodes    int         `json:"total_nodes"`
+	ResolvedNodes int         `json:"resolved_nodes"`
+	UnknownNodes  int         `json:"unknown_nodes"`
+	Countries     []geoOption `json:"countries"`
+	Regions       []geoOption `json:"regions"`
+	Cities        []geoOption `json:"cities"`
+}
+
+func (s *Server) handleGeoOptions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.ensureNodeManager(w) {
+		return
+	}
+
+	nodes, err := s.nodeMgr.ListConfigNodes(r.Context())
+	if err != nil {
+		s.respondNodeError(w, err)
+		return
+	}
+
+	// Resolve GeoIP in-memory (best effort). This does not persist anything.
+	tmp := &config.Config{Nodes: nodes}
+	tmp.PopulateNodeGeo(r.Context())
+	nodes = tmp.Nodes
+
+	type counter struct {
+		label string
+		count int
+	}
+
+	countryMap := make(map[string]*counter)
+	regionMap := make(map[string]*counter)
+	cityMap := make(map[string]*counter)
+
+	resolved := 0
+	unknown := 0
+	for _, n := range nodes {
+		if n.Geo == nil || strings.TrimSpace(n.Geo.Error) != "" {
+			unknown++
+			continue
+		}
+		cc := strings.TrimSpace(n.Geo.CountryCode)
+		country := strings.TrimSpace(n.Geo.Country)
+		region := strings.TrimSpace(n.Geo.Region)
+		city := strings.TrimSpace(n.Geo.City)
+
+		if cc == "" && country == "" && region == "" && city == "" {
+			unknown++
+			continue
+		}
+		resolved++
+
+		if cc != "" || country != "" {
+			key := cc
+			if key == "" {
+				key = country
+			}
+			label := strings.TrimSpace(strings.Join([]string{cc, country}, " "))
+			label = strings.TrimSpace(strings.ReplaceAll(label, "  ", " "))
+			if label == "" {
+				label = key
+			}
+			if c, ok := countryMap[key]; ok {
+				c.count++
+			} else {
+				countryMap[key] = &counter{label: label, count: 1}
+			}
+		}
+
+		if region != "" {
+			key := region
+			label := region
+			if cc != "" {
+				label = fmt.Sprintf("%s · %s", cc, region)
+			}
+			if c, ok := regionMap[key]; ok {
+				c.count++
+			} else {
+				regionMap[key] = &counter{label: label, count: 1}
+			}
+		}
+
+		if city != "" {
+			key := city
+			label := city
+			if cc != "" {
+				label = fmt.Sprintf("%s · %s", cc, city)
+			}
+			if c, ok := cityMap[key]; ok {
+				c.count++
+			} else {
+				cityMap[key] = &counter{label: label, count: 1}
+			}
+		}
+	}
+
+	toSorted := func(m map[string]*counter) []geoOption {
+		out := make([]geoOption, 0, len(m))
+		for value, c := range m {
+			out = append(out, geoOption{Value: value, Label: c.label, Count: c.count})
+		}
+		sort.Slice(out, func(i, j int) bool {
+			if out[i].Count != out[j].Count {
+				return out[i].Count > out[j].Count
+			}
+			return out[i].Label < out[j].Label
+		})
+		return out
+	}
+
+	resp := geoOptionsResponse{
+		TotalNodes:    len(nodes),
+		ResolvedNodes: resolved,
+		UnknownNodes:  unknown,
+		Countries:     toSorted(countryMap),
+		Regions:       toSorted(regionMap),
+		Cities:        toSorted(cityMap),
+	}
+	writeJSON(w, resp)
 }
 
 // handleSubscriptionStatus returns the current subscription refresh status.
@@ -578,15 +982,27 @@ func (s *Server) handleSubscriptionStatus(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	hasSubscriptions := false
+	autoEnabled := false
+	s.cfgMu.RLock()
+	if s.cfgSrc != nil {
+		hasSubscriptions = len(s.cfgSrc.Subscriptions) > 0
+		autoEnabled = hasSubscriptions && s.cfgSrc.SubscriptionRefresh.Enabled
+	}
+	s.cfgMu.RUnlock()
+
 	status := s.subRefresher.Status()
 	writeJSON(w, map[string]any{
-		"enabled":       true,
-		"last_refresh":  status.LastRefresh,
-		"next_refresh":  status.NextRefresh,
-		"node_count":    status.NodeCount,
-		"last_error":    status.LastError,
-		"refresh_count": status.RefreshCount,
-		"is_refreshing": status.IsRefreshing,
+		// enabled means "subscription feature is configured" so UI can show the refresh button.
+		"enabled":        hasSubscriptions,
+		"auto_enabled":   autoEnabled,
+		"last_refresh":   status.LastRefresh,
+		"next_refresh":   status.NextRefresh,
+		"node_count":     status.NodeCount,
+		"last_error":     status.LastError,
+		"refresh_count":  status.RefreshCount,
+		"is_refreshing":  status.IsRefreshing,
+		"nodes_modified": status.NodesModified,
 	})
 }
 
@@ -600,6 +1016,14 @@ func (s *Server) handleSubscriptionRefresh(w http.ResponseWriter, r *http.Reques
 	if s.subRefresher == nil {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		writeJSON(w, map[string]any{"error": "订阅刷新未启用"})
+		return
+	}
+	s.cfgMu.RLock()
+	hasSubscriptions := s.cfgSrc != nil && len(s.cfgSrc.Subscriptions) > 0
+	s.cfgMu.RUnlock()
+	if !hasSubscriptions {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		writeJSON(w, map[string]any{"error": "未配置订阅链接"})
 		return
 	}
 

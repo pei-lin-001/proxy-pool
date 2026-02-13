@@ -13,6 +13,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"easy_proxies/internal/geo"
+
 	M "github.com/sagernet/sing/common/metadata"
 )
 
@@ -30,12 +32,13 @@ type Config struct {
 
 // NodeInfo is static metadata about a proxy entry.
 type NodeInfo struct {
-	Tag           string `json:"tag"`
-	Name          string `json:"name"`
-	URI           string `json:"uri"`
-	Mode          string `json:"mode"`
-	ListenAddress string `json:"listen_address,omitempty"`
-	Port          uint16 `json:"port,omitempty"`
+	Tag           string    `json:"tag"`
+	Name          string    `json:"name"`
+	URI           string    `json:"uri"`
+	Mode          string    `json:"mode"`
+	ListenAddress string    `json:"listen_address,omitempty"`
+	Port          uint16    `json:"port,omitempty"`
+	Geo           *geo.Info `json:"geo,omitempty"`
 }
 
 // TimelineEvent represents a single usage event for debug tracking.
@@ -110,6 +113,17 @@ type Logger interface {
 	Warn(args ...any)
 }
 
+// ResetNodes clears all tracked node entries.
+// This is used on config reloads so the UI only shows currently active nodes.
+func (m *Manager) ResetNodes() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.nodes = make(map[string]*entry)
+	m.mu.Unlock()
+}
+
 // NewManager constructs a manager and pre-validates the probe target.
 func NewManager(cfg Config) (*Manager, error) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -119,34 +133,56 @@ func NewManager(cfg Config) (*Manager, error) {
 		ctx:    ctx,
 		cancel: cancel,
 	}
-	if cfg.ProbeTarget != "" {
-		target := cfg.ProbeTarget
-		// Strip URL scheme if present (e.g., "https://www.google.com:443" -> "www.google.com:443")
-		if strings.HasPrefix(target, "https://") {
-			target = strings.TrimPrefix(target, "https://")
-		} else if strings.HasPrefix(target, "http://") {
-			target = strings.TrimPrefix(target, "http://")
-		}
-		// Remove trailing path if present
-		if idx := strings.Index(target, "/"); idx != -1 {
-			target = target[:idx]
-		}
-		host, port, err := net.SplitHostPort(target)
-		if err != nil {
-			// If no port specified, use default based on original scheme
-			if strings.HasPrefix(cfg.ProbeTarget, "https://") {
-				host = target
-				port = "443"
-			} else {
-				host = target
-				port = "80"
-			}
-		}
-		parsed := M.ParseSocksaddrHostPort(host, parsePort(port))
-		m.probeDst = parsed
-		m.probeReady = true
-	}
+	m.applyProbeTargetLocked(cfg.ProbeTarget)
 	return m, nil
+}
+
+// SetProbeTarget updates the probe target used by manual probes and periodic health checks.
+// It takes effect immediately for new probes.
+func (m *Manager) SetProbeTarget(target string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.cfg.ProbeTarget = target
+	m.applyProbeTargetLocked(target)
+	m.mu.Unlock()
+}
+
+func (m *Manager) applyProbeTargetLocked(target string) {
+	m.probeReady = false
+	m.probeDst = M.Socksaddr{}
+
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return
+	}
+
+	normalized := target
+	// Strip URL scheme if present (e.g., "https://www.google.com:443" -> "www.google.com:443")
+	if strings.HasPrefix(normalized, "https://") {
+		normalized = strings.TrimPrefix(normalized, "https://")
+	} else if strings.HasPrefix(normalized, "http://") {
+		normalized = strings.TrimPrefix(normalized, "http://")
+	}
+	// Remove trailing path if present
+	if idx := strings.Index(normalized, "/"); idx != -1 {
+		normalized = normalized[:idx]
+	}
+
+	host, port, err := net.SplitHostPort(normalized)
+	if err != nil {
+		// If no port specified, use default based on original scheme
+		host = normalized
+		if strings.HasPrefix(target, "https://") {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+
+	m.probeDst = M.ParseSocksaddrHostPort(host, parsePort(port))
+	m.probeReady = true
 }
 
 // SetLogger sets the logger for the manager.
@@ -158,7 +194,7 @@ func (m *Manager) SetLogger(logger Logger) {
 // interval: how often to check (e.g., 30 * time.Second)
 // timeout: timeout for each probe (e.g., 10 * time.Second)
 func (m *Manager) StartPeriodicHealthCheck(interval, timeout time.Duration) {
-	if !m.probeReady {
+	if _, ok := m.DestinationForProbe(); !ok {
 		if m.logger != nil {
 			m.logger.Warn("probe target not configured, periodic health check disabled")
 		}
@@ -295,6 +331,8 @@ func (m *Manager) Register(info NodeInfo) *EntryHandle {
 
 // DestinationForProbe exposes the configured destination for health checks.
 func (m *Manager) DestinationForProbe() (M.Socksaddr, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	if !m.probeReady {
 		return M.Socksaddr{}, false
 	}
@@ -603,4 +641,17 @@ func (h *EntryHandle) MarkAvailable(available bool) {
 	h.ref.mu.Lock()
 	h.ref.available = available
 	h.ref.mu.Unlock()
+}
+
+// Availability returns whether the entry has completed at least one health check and its current availability.
+// If the entry is nil, it returns (false, true) so callers won't accidentally filter it out.
+func (h *EntryHandle) Availability() (checked bool, available bool) {
+	if h == nil || h.ref == nil {
+		return false, true
+	}
+	h.ref.mu.RLock()
+	checked = h.ref.initialCheckDone
+	available = h.ref.available
+	h.ref.mu.RUnlock()
+	return checked, available
 }

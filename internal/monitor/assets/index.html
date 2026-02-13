@@ -490,6 +490,9 @@
       display: none;
       align-items: center;
       justify-content: center;
+      padding: 24px 16px;
+      overflow-y: auto;
+      -webkit-overflow-scrolling: touch;
       z-index: 2000;
       animation: fadeIn 0.3s;
     }
@@ -509,9 +512,20 @@
       padding: 48px;
       box-shadow: var(--shadow-lg);
       max-width: 420px;
+      max-height: calc(100vh - 64px);
       width: 90%;
+      overflow-y: auto;
+      overscroll-behavior: contain;
       animation: slideUp 0.4s cubic-bezier(0.4, 0, 0.2, 1);
     }
+
+    /* Settings modal is wider and more compact to fit more fields. */
+    #settingsOverlay .login-modal {
+      max-width: 720px;
+    }
+
+    #settingsOverlay .login-header { margin-bottom: 20px; }
+    #settingsOverlay .login-form { gap: 16px; }
 
     @keyframes slideUp {
       from {
@@ -579,6 +593,145 @@
       font-size: 12px;
       color: var(--text-secondary);
       margin-top: 4px;
+    }
+
+    /* Geo quick filter */
+    .geo-quick-bar {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    .geo-quick-bar .form-input {
+      flex: 1;
+      min-width: 220px;
+    }
+
+    .geo-quick-single {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 13px;
+      color: var(--text-secondary);
+      user-select: none;
+      white-space: nowrap;
+    }
+
+    .geo-quick-options {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding: 12px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.6);
+      max-height: 260px;
+      overflow: auto;
+    }
+
+    .geo-group-title {
+      width: 100%;
+      font-size: 12px;
+      color: var(--text-secondary);
+      margin: 6px 0 2px;
+    }
+
+    .geo-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      border-radius: 980px;
+      border: 1px solid var(--border);
+      background: rgba(255, 255, 255, 0.85);
+      font-size: 13px;
+      cursor: pointer;
+      user-select: none;
+      transition: all 0.2s;
+    }
+
+    .geo-chip:hover {
+      box-shadow: var(--shadow-sm);
+      transform: translateY(-1px);
+    }
+
+    .geo-chip input {
+      margin: 0;
+    }
+
+    .geo-chip .count {
+      color: var(--text-secondary);
+      font-size: 12px;
+      font-family: "SF Mono", Menlo, Monaco, monospace;
+    }
+
+    /* Subscription list */
+    .sub-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .sub-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.75);
+    }
+
+    .sub-url {
+      flex: 1;
+      min-width: 0;
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--text-primary);
+      font-family: "SF Mono", Menlo, Monaco, monospace;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .sub-add-row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    .sub-add-row .form-input {
+      flex: 1;
+      min-width: 220px;
+    }
+
+    .sub-advanced {
+      margin-top: 8px;
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.5);
+    }
+
+    .sub-advanced summary {
+      cursor: pointer;
+      font-size: 13px;
+      color: var(--text-secondary);
+      user-select: none;
+      list-style: none;
+      outline: none;
+    }
+
+    .sub-advanced summary::-webkit-details-marker {
+      display: none;
+    }
+
+    .sub-advanced[open] summary {
+      color: var(--text-primary);
+      font-weight: 600;
+      margin-bottom: 8px;
     }
 
     .login-error {
@@ -1002,8 +1155,8 @@
         ⚠️ 重载配置会中断所有现有连接，请谨慎操作
       </div>
 
-      <div id="subscriptionWarning" class="reload-warning" style="display: none; background: rgba(255, 59, 48, 0.1); border-color: rgba(255, 59, 48, 0.3); color: var(--error);">
-        ⚠️ 当前使用订阅模式：您的修改会保存到 nodes.txt，但下次刷新订阅时将被覆盖
+      <div id="subscriptionWarning" class="reload-warning" style="display: none; background: rgba(255, 149, 0, 0.12); border-color: rgba(255, 149, 0, 0.35); color: var(--warning);">
+        ℹ️ 当前启用订阅：订阅节点来自订阅刷新（会写入 nodes.txt 并可能被覆盖）；你在此处添加/编辑的自定义节点会保存到 config.yaml，不会被订阅覆盖
       </div>
 
       <div id="configNodesContainer" class="config-nodes-grid"></div>
@@ -1129,6 +1282,81 @@
           </label>
         </div>
         <p class="form-help" style="margin-top: -8px;">启用后所有节点将忽略 SSL 证书错误，修改后需重载生效</p>
+
+        <div style="height: 1px; background: rgba(0,0,0,0.06); margin: 18px 0;"></div>
+
+        <div class="form-group">
+          <label class="form-label" for="settingSubscriptions">订阅链接（每行一个）</label>
+          <div id="subscriptionList" class="sub-list"></div>
+          <div class="sub-add-row">
+            <input type="text" id="subscriptionAddInput" class="form-input" placeholder="粘贴订阅链接后点击添加" />
+            <button type="button" class="btn btn-secondary btn-sm" onclick="addSubscriptionFromInput()">添加</button>
+          </div>
+          <details class="sub-advanced">
+            <summary>高级：批量编辑订阅链接（每行一个）</summary>
+            <textarea id="settingSubscriptions" class="form-input" rows="5" placeholder="https://example.com/subscribe"></textarea>
+          </details>
+          <p class="form-help">添加/修改订阅后需要刷新订阅或重载配置生效</p>
+        </div>
+        <div class="form-group" style="display: flex; align-items: center; gap: 12px;">
+          <label class="form-label" for="settingSubRefreshEnabled" style="margin: 0; flex: 1;">启用订阅定时刷新</label>
+          <label class="toggle-switch">
+            <input type="checkbox" id="settingSubRefreshEnabled" />
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="settingSubRefreshInterval">刷新间隔</label>
+          <input type="text" id="settingSubRefreshInterval" class="form-input" placeholder="例如：1h / 30m / 6h" />
+          <p class="form-help">Go duration 格式；留空则保持现有配置</p>
+        </div>
+
+        <div style="height: 1px; background: rgba(0,0,0,0.06); margin: 18px 0;"></div>
+
+        <div class="form-group">
+          <label class="form-label" for="settingNodeFilterTarget">节点过滤依据</label>
+          <select id="settingNodeFilterTarget" class="form-input">
+            <option value="name">按节点名称</option>
+            <option value="geo">按服务器 IP 位置（GeoIP）</option>
+            <option value="name_or_geo">按名称或 GeoIP</option>
+          </select>
+          <p class="form-help">选择 GeoIP 时，会解析节点服务器 IP 并查询地理位置后再匹配 include/exclude（修改后需重载生效）</p>
+        </div>
+
+        <div class="form-group">
+          <label class="form-label">地区快捷选择</label>
+          <div class="geo-quick-bar">
+            <input type="text" id="geoQuickSearch" class="form-input" placeholder="搜索：US / 美国 / 香港 / 洛杉矶" />
+            <label class="geo-quick-single" title="开启后，每次只能选择一个地区">
+              <input type="checkbox" id="geoQuickSingle" />
+              单选
+            </label>
+            <button type="button" class="btn btn-secondary btn-sm" onclick="refreshGeoOptions()">刷新列表</button>
+            <button type="button" class="btn btn-secondary btn-sm" onclick="clearGeoSelection()">清空</button>
+          </div>
+          <div id="geoQuickStatus" class="form-help">点击“刷新列表”自动解析节点地区（GeoIP）</div>
+          <div id="geoQuickOptions" class="geo-quick-options" style="display:none;"></div>
+          <p class="form-help">勾选地区后会自动设置为「按服务器 IP 位置（GeoIP）」并同步到下方 include；你仍可手动编辑 include/exclude</p>
+        </div>
+
+        <div class="form-group">
+          <label class="form-label" for="settingNodeFilterInclude">节点过滤（包含关键字/正则）</label>
+          <input type="text" id="settingNodeFilterInclude" class="form-input" placeholder="例如：香港, HK, 🇭🇰" />
+          <p class="form-help">留空表示不过滤；多个用逗号或换行分隔</p>
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="settingNodeFilterExclude">节点过滤（排除）</label>
+          <input type="text" id="settingNodeFilterExclude" class="form-input" placeholder="例如：测试, 过期" />
+        </div>
+        <div class="form-group" style="display: flex; align-items: center; gap: 12px;">
+          <label class="form-label" for="settingNodeFilterUseRegex" style="margin: 0; flex: 1;">使用正则匹配</label>
+          <label class="toggle-switch">
+            <input type="checkbox" id="settingNodeFilterUseRegex" />
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+        <p class="form-help" style="margin-top: -8px;">启用后 include/exclude 将按 Go 正则匹配，可用 (?i) 忽略大小写；修改后需重载生效</p>
+
         <div id="settingsError" class="login-error"></div>
         <div class="modal-buttons">
           <button type="button" class="btn btn-secondary" onclick="hideSettingsModal()">取消</button>
@@ -1333,13 +1561,28 @@
         const status = getNodeStatus(node);
         const latency = node.last_latency_ms || -1;
         const quality = getLatencyQuality(latency);
+        const geo = node.geo || null;
+        let geoText = '';
+        let geoTitle = '';
+        if (geo) {
+          const parts = [geo.country_code, geo.country, geo.region, geo.city].filter(Boolean);
+          if (parts.length > 0) {
+            geoText = parts.join(' ');
+            const extra = [geo.ip ? `IP ${geo.ip}` : '', geo.asn || '', geo.isp || ''].filter(Boolean).join(' · ');
+            geoTitle = extra;
+          } else if (geo.error) {
+            geoText = 'GeoIP 失败';
+            geoTitle = geo.error;
+          }
+        }
 
         return `
           <div class="node-card ${status}">
             <div class="node-header">
               <div class="node-info">
-                <div class="node-name">${node.name || node.tag}</div>
-                <div class="node-tag">${node.tag}</div>
+                <div class="node-name">${escapeHtml(node.name || node.tag || '')}</div>
+                <div class="node-tag">${escapeHtml(node.tag || '')}</div>
+                ${geoText ? `<div class="node-tag" style="margin-top:4px;opacity:0.9;" ${geoTitle ? `title="${escapeHtml(geoTitle)}"` : ''}>📍 ${escapeHtml(geoText)}</div>` : ''}
               </div>
               <span class="status-badge ${status}">
                 <span class="status-icon"></span>
@@ -1750,18 +1993,312 @@
 
     // ========== 系统设置功能 ==========
 
+    function parseListText(text) {
+      return (text || '')
+        .split(/[\n,]+/)
+        .map(s => s.trim())
+        .filter(Boolean);
+    }
+
+    function parseSubscriptionsText(text) {
+      return (text || '')
+        .split('\n')
+        .map(s => s.trim())
+        .filter(Boolean);
+    }
+
+    function uniqueListKeepOrder(items) {
+      const seen = new Set();
+      const out = [];
+      for (const item of items || []) {
+        const v = String(item || '').trim();
+        if (!v) continue;
+        if (seen.has(v)) continue;
+        seen.add(v);
+        out.push(v);
+      }
+      return out;
+    }
+
+    function getSubscriptionsFromTextarea() {
+      const ta = document.getElementById('settingSubscriptions');
+      if (!ta) return [];
+      return uniqueListKeepOrder(parseSubscriptionsText(ta.value));
+    }
+
+    function setSubscriptionsToTextarea(list) {
+      const ta = document.getElementById('settingSubscriptions');
+      if (!ta) return;
+      ta.value = uniqueListKeepOrder(list).join('\n');
+    }
+
+    function renderSubscriptionList() {
+      const container = document.getElementById('subscriptionList');
+      if (!container) return;
+
+      const subs = getSubscriptionsFromTextarea();
+      if (subs.length === 0) {
+        container.innerHTML = '<div class="form-help">未配置订阅链接</div>';
+        return;
+      }
+
+      container.innerHTML = subs.map((url, idx) => {
+        const safe = escapeHtml(url);
+        return `
+          <div class="sub-item">
+            <div class="sub-url" title="${safe}">${safe}</div>
+            <button type="button" class="btn btn-secondary btn-sm" data-sub-action="copy" data-index="${idx}">复制</button>
+            <button type="button" class="btn btn-danger btn-sm" data-sub-action="remove" data-index="${idx}">删除</button>
+          </div>
+        `;
+      }).join('');
+    }
+
+    async function copyToClipboard(text) {
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(text);
+          showToast('已复制到剪贴板', 'success');
+          return;
+        }
+      } catch (_) {}
+      // Fallback
+      window.prompt('复制订阅链接', text);
+    }
+
+    function addSubscriptionFromInput() {
+      const input = document.getElementById('subscriptionAddInput');
+      if (!input) return;
+      const raw = (input.value || '').trim();
+      if (!raw) return;
+
+      // Support multi-line paste.
+      const additions = uniqueListKeepOrder(parseSubscriptionsText(raw));
+      if (additions.length === 0) return;
+
+      const subs = getSubscriptionsFromTextarea();
+      const merged = uniqueListKeepOrder([...subs, ...additions]);
+      setSubscriptionsToTextarea(merged);
+      input.value = '';
+      renderSubscriptionList();
+    }
+
+    function initSubscriptionUI() {
+      const ta = document.getElementById('settingSubscriptions');
+      const container = document.getElementById('subscriptionList');
+      if (ta && !ta.dataset.boundSubscriptions) {
+        ta.dataset.boundSubscriptions = '1';
+        ta.addEventListener('input', () => {
+          renderSubscriptionList();
+        });
+      }
+      if (container && !container.dataset.boundSubscriptions) {
+        container.dataset.boundSubscriptions = '1';
+        container.addEventListener('click', (ev) => {
+          const btn = ev.target.closest('button[data-sub-action]');
+          if (!btn) return;
+          const action = btn.dataset.subAction;
+          const idx = parseInt(btn.dataset.index || '', 10);
+          const subs = getSubscriptionsFromTextarea();
+          if (!Number.isFinite(idx) || idx < 0 || idx >= subs.length) return;
+
+          if (action === 'copy') {
+            copyToClipboard(subs[idx]);
+          } else if (action === 'remove') {
+            subs.splice(idx, 1);
+            setSubscriptionsToTextarea(subs);
+            renderSubscriptionList();
+          }
+        });
+      }
+    }
+
+    let geoOptionsCache = null;
+    let geoOptionsLoading = false;
+    let geoQuickInitialized = false;
+
+    function initGeoQuickUI() {
+      if (geoQuickInitialized) return;
+      geoQuickInitialized = true;
+
+      const searchEl = document.getElementById('geoQuickSearch');
+      if (searchEl) {
+        searchEl.addEventListener('input', () => renderGeoOptions());
+      }
+
+      const includeEl = document.getElementById('settingNodeFilterInclude');
+      if (includeEl) {
+        includeEl.addEventListener('input', () => applyIncludeToGeoSelection());
+      }
+
+      const optionsEl = document.getElementById('geoQuickOptions');
+      if (optionsEl) {
+        optionsEl.addEventListener('change', (ev) => {
+          const t = ev.target;
+          if (!(t instanceof HTMLInputElement)) return;
+          if (t.type !== 'checkbox' || t.dataset.geoOption !== '1') return;
+
+          const single = document.getElementById('geoQuickSingle');
+          if (single && single.checked && t.checked) {
+            // 单选：取消其他选项
+            optionsEl.querySelectorAll('input[type="checkbox"][data-geo-option="1"]').forEach(cb => {
+              if (cb !== t) cb.checked = false;
+            });
+          }
+
+          syncGeoSelectionToInclude();
+        });
+      }
+    }
+
+    function syncGeoSelectionToInclude() {
+      const optionsEl = document.getElementById('geoQuickOptions');
+      const includeEl = document.getElementById('settingNodeFilterInclude');
+      const targetEl = document.getElementById('settingNodeFilterTarget');
+      if (!optionsEl || !includeEl || !targetEl) return;
+
+      const values = Array.from(optionsEl.querySelectorAll('input[type="checkbox"][data-geo-option="1"]:checked'))
+        .map(cb => cb.value)
+        .filter(Boolean);
+
+      // 自动切换为 GeoIP 过滤
+      if (values.length > 0) {
+        targetEl.value = 'geo';
+      }
+      includeEl.value = values.join(', ');
+    }
+
+    function applyIncludeToGeoSelection() {
+      const optionsEl = document.getElementById('geoQuickOptions');
+      const includeEl = document.getElementById('settingNodeFilterInclude');
+      if (!optionsEl || !includeEl) return;
+
+      const includeSet = new Set(parseListText(includeEl.value));
+      optionsEl.querySelectorAll('input[type="checkbox"][data-geo-option="1"]').forEach(cb => {
+        cb.checked = includeSet.has(cb.value);
+      });
+    }
+
+    function clearGeoSelection() {
+      const optionsEl = document.getElementById('geoQuickOptions');
+      const includeEl = document.getElementById('settingNodeFilterInclude');
+      if (optionsEl) {
+        optionsEl.querySelectorAll('input[type="checkbox"][data-geo-option="1"]').forEach(cb => cb.checked = false);
+      }
+      if (includeEl) {
+        includeEl.value = '';
+      }
+    }
+
+    function renderGeoOptions() {
+      const data = geoOptionsCache;
+      const optionsEl = document.getElementById('geoQuickOptions');
+      const statusEl = document.getElementById('geoQuickStatus');
+      if (!optionsEl || !statusEl) return;
+
+      if (!data) {
+        optionsEl.style.display = 'none';
+        statusEl.textContent = '点击“刷新列表”自动解析节点地区（GeoIP）';
+        return;
+      }
+
+      const search = (document.getElementById('geoQuickSearch')?.value || '').trim().toLowerCase();
+      const includeSet = new Set(parseListText(document.getElementById('settingNodeFilterInclude')?.value || ''));
+
+      const groups = [
+        { title: '国家/地区', list: data.countries || [] },
+        { title: '省/州', list: data.regions || [] },
+        { title: '城市', list: data.cities || [] },
+      ];
+
+      const filterList = (list) => {
+        if (!search) return list;
+        return list.filter(opt => {
+          const label = (opt.label || '').toLowerCase();
+          const value = (opt.value || '').toLowerCase();
+          return label.includes(search) || value.includes(search);
+        });
+      };
+
+      let html = '';
+      for (const g of groups) {
+        const list = filterList(g.list);
+        if (list.length === 0) continue;
+        html += `<div class="geo-group-title">${escapeHtml(g.title)}</div>`;
+        html += list.map(opt => {
+          const value = String(opt.value || '').trim();
+          if (!value) return '';
+          const label = String(opt.label || value);
+          const checked = includeSet.has(value) ? 'checked' : '';
+          return `
+            <label class="geo-chip" title="${escapeHtml(value)}">
+              <input data-geo-option="1" type="checkbox" value="${escapeHtml(value)}" ${checked} />
+              <span>${escapeHtml(label)}</span>
+              <span class="count">(${opt.count || 0})</span>
+            </label>
+          `;
+        }).join('');
+      }
+
+      optionsEl.innerHTML = html || `<div class="form-help">没有匹配的地区（尝试清空搜索）</div>`;
+      optionsEl.style.display = 'flex';
+      statusEl.textContent = `已解析 ${data.resolved_nodes || 0}/${data.total_nodes || 0}，未知 ${data.unknown_nodes || 0}（勾选即可生成筛选）`;
+    }
+
+    async function refreshGeoOptions() {
+      const statusEl = document.getElementById('geoQuickStatus');
+      if (!statusEl || geoOptionsLoading) return;
+
+      geoOptionsLoading = true;
+      statusEl.textContent = '正在解析节点地区（GeoIP）...';
+      try {
+        const res = await fetch('/api/geo/options');
+        if (!res.ok) {
+          const data = await res.json().catch(() => ({}));
+          throw new Error(data.error || `HTTP ${res.status}`);
+        }
+        geoOptionsCache = await res.json();
+        renderGeoOptions();
+        applyIncludeToGeoSelection();
+      } catch (err) {
+        statusEl.textContent = '解析失败: ' + (err?.message || String(err));
+      } finally {
+        geoOptionsLoading = false;
+      }
+    }
+
     function showSettingsModal() {
       fetch('/api/settings')
         .then(res => res.ok ? res.json() : {})
         .then(data => {
+          initGeoQuickUI();
+          initSubscriptionUI();
           document.getElementById('settingExternalIP').value = data.external_ip || '';
           document.getElementById('settingProbeTarget').value = data.probe_target || '';
           document.getElementById('settingSkipCertVerify').checked = data.skip_cert_verify || false;
+          document.getElementById('settingSubscriptions').value = (data.subscriptions || []).join('\n');
+          renderSubscriptionList();
+          document.getElementById('settingSubRefreshEnabled').checked = (data.subscription_refresh && data.subscription_refresh.enabled) || false;
+          document.getElementById('settingSubRefreshInterval').value = (data.subscription_refresh && data.subscription_refresh.interval) ? data.subscription_refresh.interval : '';
+          document.getElementById('settingNodeFilterTarget').value = (data.node_filter && data.node_filter.target) ? data.node_filter.target : 'name';
+          document.getElementById('settingNodeFilterInclude').value = (data.node_filter && data.node_filter.include) ? data.node_filter.include.join(', ') : '';
+          document.getElementById('settingNodeFilterExclude').value = (data.node_filter && data.node_filter.exclude) ? data.node_filter.exclude.join(', ') : '';
+          document.getElementById('settingNodeFilterUseRegex').checked = (data.node_filter && data.node_filter.use_regex) || false;
+          if (geoOptionsCache) {
+            renderGeoOptions();
+            applyIncludeToGeoSelection();
+          } else {
+            // Auto-load once for better UX.
+            refreshGeoOptions();
+          }
           document.getElementById('settingsError').classList.remove('show');
           document.getElementById('settingsOverlay').classList.add('show');
         })
         .catch(err => {
           console.error('Failed to load settings', err);
+          initGeoQuickUI();
+          initSubscriptionUI();
+          renderSubscriptionList();
           document.getElementById('settingsOverlay').classList.add('show');
         });
     }
@@ -1778,7 +2315,23 @@
       const payload = {
         external_ip: document.getElementById('settingExternalIP').value.trim(),
         probe_target: document.getElementById('settingProbeTarget').value.trim(),
-        skip_cert_verify: document.getElementById('settingSkipCertVerify').checked
+        skip_cert_verify: document.getElementById('settingSkipCertVerify').checked,
+        subscriptions: (document.getElementById('settingSubscriptions').value || '')
+          .split('\n')
+          .map(s => s.trim())
+          .filter(Boolean),
+        subscription_refresh: (() => {
+          const interval = document.getElementById('settingSubRefreshInterval').value.trim();
+          const obj = { enabled: document.getElementById('settingSubRefreshEnabled').checked };
+          if (interval) obj.interval = interval;
+          return obj;
+        })(),
+        node_filter: {
+          target: document.getElementById('settingNodeFilterTarget').value,
+          include: parseListText(document.getElementById('settingNodeFilterInclude').value),
+          exclude: parseListText(document.getElementById('settingNodeFilterExclude').value),
+          use_regex: document.getElementById('settingNodeFilterUseRegex').checked
+        }
       };
 
       try {
@@ -1791,10 +2344,11 @@
         const data = await res.json();
         if (res.ok) {
           if (data.need_reload) {
-            showToast('设置已保存，SSL 设置需重载生效', 'success');
+            showToast('设置已保存，需要重载配置才能生效', 'success');
           } else {
             showToast('设置保存成功', 'success');
           }
+          fetchSubscriptionStatus();
           hideSettingsModal();
         } else {
           errorEl.textContent = data.error || '保存失败';

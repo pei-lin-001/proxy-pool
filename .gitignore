@@ -7,10 +7,13 @@ easy_proxies-*
 
 # Configuration (contains sensitive data)
 config.yaml
+config.local.yaml
+config.local.yml
 nodes.txt
 
 # Logs
 *.log
+*.pid
 
 # IDE and editor
 .idea/

@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"easy_proxies/internal/geo"
 	"easy_proxies/internal/monitor"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -32,6 +34,8 @@ const (
 	modeSequential = "sequential"
 	modeRandom     = "random"
 	modeBalance    = "balance"
+
+	defaultDialAttempts = 3
 )
 
 // Options controls pool outbound behaviour.
@@ -50,6 +54,7 @@ type MemberMeta struct {
 	Mode          string
 	ListenAddress string
 	Port          uint16
+	Geo           *geo.Info
 }
 
 // Register wires the pool outbound into the registry.
@@ -122,6 +127,7 @@ func newPool(ctx context.Context, _ adapter.Router, logger log.ContextLogger, ta
 				Mode:          meta.Mode,
 				ListenAddress: meta.ListenAddress,
 				Port:          meta.Port,
+				Geo:           meta.Geo,
 			}
 			entry := monitorMgr.Register(info)
 			if entry != nil {
@@ -215,6 +221,7 @@ func (p *poolOutbound) initializeMembersLocked() error {
 				Mode:          meta.Mode,
 				ListenAddress: meta.ListenAddress,
 				Port:          meta.Port,
+				Geo:           meta.Geo,
 			}
 			entry := p.monitor.Register(info)
 			if entry != nil {
@@ -310,38 +317,152 @@ func (p *poolOutbound) probeAllMembersOnStartup() {
 }
 
 func (p *poolOutbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
-	member, err := p.pickMember(network)
+	candidates, err := p.pickCandidates(network)
 	if err != nil {
 		return nil, err
 	}
-	p.incActive(member)
-	conn, err := member.outbound.DialContext(ctx, network, destination)
-	if err != nil {
-		p.decActive(member)
-		p.recordFailure(member, err)
-		return nil, err
+	defer p.putCandidateBuffer(candidates)
+
+	attempts := defaultDialAttempts
+	if attempts <= 0 || attempts > len(candidates) {
+		attempts = len(candidates)
 	}
-	p.recordSuccess(member)
-	return p.wrapConn(conn, member), nil
+
+	var lastErr error
+	tryDial := func(member *memberState) (net.Conn, bool) {
+		p.incActive(member)
+		conn, err := member.outbound.DialContext(ctx, network, destination)
+		if err != nil {
+			p.decActive(member)
+			p.recordFailure(member, err)
+			lastErr = err
+			return nil, false
+		}
+		p.recordSuccess(member)
+		return p.wrapConn(conn, member), true
+	}
+
+	switch p.mode {
+	case modeRandom:
+		p.rngMu.Lock()
+		p.rng.Shuffle(len(candidates), func(i, j int) { candidates[i], candidates[j] = candidates[j], candidates[i] })
+		p.rngMu.Unlock()
+		for i := 0; i < attempts; i++ {
+			if conn, ok := tryDial(candidates[i]); ok {
+				return conn, nil
+			}
+		}
+	case modeBalance:
+		sort.Slice(candidates, func(i, j int) bool {
+			var activeI, activeJ int32
+			if candidates[i].shared != nil {
+				activeI = candidates[i].shared.activeCount()
+			}
+			if candidates[j].shared != nil {
+				activeJ = candidates[j].shared.activeCount()
+			}
+			return activeI < activeJ
+		})
+		for i := 0; i < attempts; i++ {
+			if conn, ok := tryDial(candidates[i]); ok {
+				return conn, nil
+			}
+		}
+	default:
+		startIdx := int(p.rrCounter.Add(1)-1) % len(candidates)
+		for i := 0; i < attempts; i++ {
+			member := candidates[(startIdx+i)%len(candidates)]
+			if conn, ok := tryDial(member); ok {
+				return conn, nil
+			}
+		}
+	}
+
+	if lastErr == nil {
+		lastErr = E.New("dial failed")
+	}
+	return nil, lastErr
 }
 
 func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
-	member, err := p.pickMember(N.NetworkUDP)
+	candidates, err := p.pickCandidates(N.NetworkUDP)
 	if err != nil {
 		return nil, err
 	}
-	p.incActive(member)
-	conn, err := member.outbound.ListenPacket(ctx, destination)
-	if err != nil {
-		p.decActive(member)
-		p.recordFailure(member, err)
-		return nil, err
+	defer p.putCandidateBuffer(candidates)
+
+	attempts := defaultDialAttempts
+	if attempts <= 0 || attempts > len(candidates) {
+		attempts = len(candidates)
 	}
-	p.recordSuccess(member)
-	return p.wrapPacketConn(conn, member), nil
+
+	var lastErr error
+	tryListen := func(member *memberState) (net.PacketConn, bool) {
+		p.incActive(member)
+		conn, err := member.outbound.ListenPacket(ctx, destination)
+		if err != nil {
+			p.decActive(member)
+			p.recordFailure(member, err)
+			lastErr = err
+			return nil, false
+		}
+		p.recordSuccess(member)
+		return p.wrapPacketConn(conn, member), true
+	}
+
+	switch p.mode {
+	case modeRandom:
+		p.rngMu.Lock()
+		p.rng.Shuffle(len(candidates), func(i, j int) { candidates[i], candidates[j] = candidates[j], candidates[i] })
+		p.rngMu.Unlock()
+		for i := 0; i < attempts; i++ {
+			if conn, ok := tryListen(candidates[i]); ok {
+				return conn, nil
+			}
+		}
+	case modeBalance:
+		sort.Slice(candidates, func(i, j int) bool {
+			var activeI, activeJ int32
+			if candidates[i].shared != nil {
+				activeI = candidates[i].shared.activeCount()
+			}
+			if candidates[j].shared != nil {
+				activeJ = candidates[j].shared.activeCount()
+			}
+			return activeI < activeJ
+		})
+		for i := 0; i < attempts; i++ {
+			if conn, ok := tryListen(candidates[i]); ok {
+				return conn, nil
+			}
+		}
+	default:
+		startIdx := int(p.rrCounter.Add(1)-1) % len(candidates)
+		for i := 0; i < attempts; i++ {
+			member := candidates[(startIdx+i)%len(candidates)]
+			if conn, ok := tryListen(member); ok {
+				return conn, nil
+			}
+		}
+	}
+
+	if lastErr == nil {
+		lastErr = E.New("listen packet failed")
+	}
+	return nil, lastErr
 }
 
 func (p *poolOutbound) pickMember(network string) (*memberState, error) {
+	candidates, err := p.pickCandidates(network)
+	if err != nil {
+		return nil, err
+	}
+	member := p.selectMember(candidates)
+	p.putCandidateBuffer(candidates)
+	return member, nil
+}
+
+func (p *poolOutbound) pickCandidates(network string) ([]*memberState, error) {
 	now := time.Now()
 	candidates := p.getCandidateBuffer()
 
@@ -369,14 +490,19 @@ func (p *poolOutbound) pickMember(network string) (*memberState, error) {
 		return nil, E.New("no healthy proxy available")
 	}
 
-	member := p.selectMember(candidates)
-	p.putCandidateBuffer(candidates)
-	return member, nil
+	return candidates, nil
 }
 
 func (p *poolOutbound) availableMembersLocked(now time.Time, network string, buf []*memberState) []*memberState {
 	result := buf[:0]
 	for _, member := range p.members {
+		// If we have health status, skip nodes that are known bad (checked & unavailable).
+		if member.entry != nil {
+			checked, available := member.entry.Availability()
+			if checked && !available {
+				continue
+			}
+		}
 		// Check blacklist via shared state (auto-clears if expired)
 		if member.shared != nil && member.shared.isBlacklisted(now) {
 			continue

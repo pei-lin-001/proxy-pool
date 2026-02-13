@@ -63,6 +63,7 @@ go build -tags "with_utls with_quic with_grpc" -o easy-proxies ./cmd/easy_proxie
 ```yaml
 mode: pool                    # Mode: pool, multi-port, or hybrid
 log_level: info               # Log level: debug, info, warn, error
+connect_timeout: 15s          # Outbound connect timeout (default 15s) to avoid long hangs
 external_ip: ""               # External IP for export (recommended for Docker)
 
 # Subscription URLs (optional, multiple supported)

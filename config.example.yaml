@@ -1,6 +1,7 @@
 mode: pool  # pool 或 multi-port（也支持 multi_port）
 log_level: info
 skip_cert_verify: false  # 全局跳过 SSL 证书验证（默认 false）
+connect_timeout: 15s  # 节点出站连接超时（默认 15s），避免代理请求长时间卡住
 management:
   enabled: true
   listen: 0.0.0.0:9090
@@ -44,4 +45,3 @@ nodes:
 # nodes_file: nodes.txt
 # nodes:
 #   - uri: "vless://xxx@server:443#额外节点"
-

@@ -63,6 +63,7 @@ go build -tags "with_utls with_quic with_grpc" -o easy-proxies ./cmd/easy_proxie
 ```yaml
 mode: pool                    # 运行模式: pool (节点池)、multi-port (多端口) 或 hybrid (混合)
 log_level: info               # 日志级别: debug, info, warn, error
+connect_timeout: 15s          # 节点出站连接超时（默认 15s），避免代理请求长时间卡住
 external_ip: ""               # 外部 IP 地址，用于导出时替换 0.0.0.0（Docker 部署时建议配置）
 
 # 订阅链接（可选，支持多个）
