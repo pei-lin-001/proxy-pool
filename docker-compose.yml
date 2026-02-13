@@ -5,6 +5,10 @@ services:
       dockerfile: Dockerfile
     image: proxy-pool:local
     container_name: proxy-pool
+    # WebUI 会写入 config.yaml / nodes.txt（例如保存订阅链接、探测目标等）。
+    # 在 Docker 场景下，这两个文件通常来自宿主机挂载，默认属于 root，非 root 用户会写入失败。
+    # 为了开箱即用，默认以 root 运行；如果你希望以非 root 运行，请确保宿主机文件可写并移除此行。
+    user: "0:0"
     restart: unless-stopped
     # 方式一：使用主机网络模式（推荐，支持端口自动重分配）
     network_mode: host

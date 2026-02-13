@@ -136,6 +136,7 @@ node_filter:
 - 订阅拉取失败/全部异常：请检查系统代理或环境变量（`http_proxy`/`https_proxy`/`all_proxy`），代理循环会导致订阅/GeoIP 请求失败。
 - GeoIP 解析为空：可能节点域名无法解析到公网 IP，或 GeoIP API 不可达；可稍后重试或改用“按名称”筛选。
 - WebUI 远程访问不到：将 `management.listen` 绑定到 `0.0.0.0`，并确认防火墙放行对应端口。
+- 保存设置失败（permission denied）：如果 `config.yaml` / `nodes.txt` 是宿主机挂载进容器的文件，请确保它们对容器运行用户可写（或让容器以 root 运行）。
 
 ## 许可证
 
