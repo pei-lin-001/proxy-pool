@@ -22,11 +22,19 @@ import (
 	"github.com/sagernet/sing/common/json/badoption"
 )
 
+var ErrNoValidNodes = errors.New("no valid nodes available")
+
 // Build converts high level config into sing-box Options tree.
 func Build(cfg *config.Config) (option.Options, error) {
+	if cfg == nil {
+		return option.Options{}, errors.New("config is nil")
+	}
+	if len(cfg.Nodes) == 0 {
+		return option.Options{}, fmt.Errorf("%w: no nodes configured", ErrNoValidNodes)
+	}
 	selectedNodes := cfg.FilterNodes()
 	if len(selectedNodes) == 0 {
-		return option.Options{}, fmt.Errorf("no nodes matched node_filter")
+		return option.Options{}, fmt.Errorf("%w: no nodes matched node_filter", ErrNoValidNodes)
 	}
 	if filtered := len(cfg.Nodes) - len(selectedNodes); filtered > 0 {
 		log.Printf("🔎 Node filter applied: %d/%d nodes enabled", len(selectedNodes), len(cfg.Nodes))
@@ -80,7 +88,7 @@ func Build(cfg *config.Config) (option.Options, error) {
 
 	// Check if we have at least one valid node
 	if len(baseOutbounds) == 0 {
-		return option.Options{}, fmt.Errorf("no valid nodes available (all %d enabled nodes failed to build)", len(selectedNodes))
+		return option.Options{}, fmt.Errorf("%w: all %d enabled nodes failed to build", ErrNoValidNodes, len(selectedNodes))
 	}
 
 	// Log summary

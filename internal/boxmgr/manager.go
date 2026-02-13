@@ -114,6 +114,10 @@ func (m *Manager) Start(ctx context.Context) error {
 		var err error
 		instance, err = m.createBox(ctx, cfg)
 		if err != nil {
+			if errors.Is(err, builder.ErrNoValidNodes) {
+				m.logger.Warnf("no valid nodes available, sing-box core not started (configure nodes/subscriptions then reload): %v", err)
+				return nil
+			}
 			return err
 		}
 		if err = instance.Start(); err != nil {
@@ -170,10 +174,6 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 	}
 
 	m.mu.Lock()
-	if m.currentBox == nil {
-		m.mu.Unlock()
-		return errors.New("manager not started")
-	}
 	ctx := m.baseCtx
 	oldBox := m.currentBox
 	oldCfg := m.cfg
@@ -245,6 +245,10 @@ func (m *Manager) Reload(newCfg *config.Config) error {
 		if m.cfg.FilePath() == "" && prevFilePath != "" {
 			m.cfg.SetFilePath(prevFilePath)
 		}
+	}
+	if m.monitorMgr != nil && !m.healthCheckStarted {
+		m.monitorMgr.StartPeriodicHealthCheck(periodicHealthInterval, periodicHealthTimeout)
+		m.healthCheckStarted = true
 	}
 	m.mu.Unlock()
 

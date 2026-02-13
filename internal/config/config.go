@@ -359,7 +359,9 @@ func (c *Config) normalize() error {
 	if c.NodesFile != "" && len(c.Subscriptions) == 0 {
 		fileNodes, err := loadNodesFromFile(c.NodesFile)
 		if err != nil {
-			return fmt.Errorf("load nodes from file %q: %w", c.NodesFile, err)
+			if !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("load nodes from file %q: %w", c.NodesFile, err)
+			}
 		}
 		for idx := range fileNodes {
 			fileNodes[idx].Source = NodeSourceFile
@@ -405,9 +407,6 @@ func (c *Config) normalize() error {
 		c.Nodes = append(c.Nodes, subNodes...)
 	}
 
-	if len(c.Nodes) == 0 {
-		return errors.New("config.nodes cannot be empty (configure nodes in config or use nodes_file)")
-	}
 	portCursor := c.MultiPort.BasePort
 	for idx := range c.Nodes {
 		c.Nodes[idx].Name = strings.TrimSpace(c.Nodes[idx].Name)
@@ -576,10 +575,6 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 	}
 	if c.SubscriptionRefresh.MinAvailableNodes <= 0 {
 		c.SubscriptionRefresh.MinAvailableNodes = 1
-	}
-
-	if len(c.Nodes) == 0 {
-		return errors.New("config.nodes cannot be empty")
 	}
 
 	// Build set of ports already assigned from portMap

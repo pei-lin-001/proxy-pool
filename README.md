@@ -57,6 +57,8 @@ go build -tags "with_utls with_quic with_grpc with_wireguard with_gvisor" -o eas
 - Pool entry: `http://username:password@127.0.0.1:2323`
 - Web UI: `http://127.0.0.1:9090`
 
+If you start with **no nodes configured**, the Web UI still starts. Add nodes/subscriptions in the UI, then click **Reload** to start the core.
+
 ## Quick start (Docker)
 
 This repo’s `docker-compose.yml` builds the image from source (so your code changes take effect).

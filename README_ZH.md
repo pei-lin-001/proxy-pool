@@ -57,6 +57,8 @@ go build -tags "with_utls with_quic with_grpc with_wireguard with_gvisor" -o eas
 - 代理入口（Pool）：`http://username:password@127.0.0.1:2323`
 - WebUI：`http://127.0.0.1:9090`
 
+如果你**暂时没有配置任何节点**，WebUI 也会正常启动。你可以在 WebUI 里添加订阅/节点，然后点击 **重载配置** 启动内核。
+
 ## 快速开始（Docker）
 
 本仓库的 `docker-compose.yml` 会从源码构建镜像（所以你修改代码后会真正生效）。
