@@ -134,6 +134,7 @@ Important: refresh/reload restarts the sing-box core, which **disconnects existi
 - **GeoIP unknown/empty**: the node host may not resolve to a public IP, or GeoIP API is unreachable; try again or use name-based filtering.
 - **Web UI not reachable**: confirm `management.listen` is bound to `0.0.0.0` if you want remote access, and ensure ports are open.
 - **Settings save fails (permission denied)**: if you mount `config.yaml` / `nodes.txt` from the host, make sure they are writable by the container user (or run the container as root).
+- **`nodes.txt` is a directory**: if you started Docker before creating `nodes.txt`, Docker may create a directory at that path. Fix: `rm -rf nodes.txt && touch nodes.txt`, then recreate the container.
 
 ## License
 

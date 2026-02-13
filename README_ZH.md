@@ -137,6 +137,7 @@ node_filter:
 - GeoIP 解析为空：可能节点域名无法解析到公网 IP，或 GeoIP API 不可达；可稍后重试或改用“按名称”筛选。
 - WebUI 远程访问不到：将 `management.listen` 绑定到 `0.0.0.0`，并确认防火墙放行对应端口。
 - 保存设置失败（permission denied）：如果 `config.yaml` / `nodes.txt` 是宿主机挂载进容器的文件，请确保它们对容器运行用户可写（或让容器以 root 运行）。
+- `nodes.txt` 变成目录：如果你在宿主机还没创建 `nodes.txt` 就启动了 Docker，Docker 可能会把它创建成同名目录。修复：`rm -rf nodes.txt && touch nodes.txt`，然后重建容器。
 
 ## 许可证
 

@@ -389,29 +389,32 @@ func (m *Manager) doRefresh() {
 
 	m.logger.Infof("fetched %d nodes from subscriptions", len(nodes))
 
-	// Write subscription nodes to nodes.txt
+	// Write subscription nodes to nodes.txt (best-effort).
+	// Even if it fails (e.g. host bind mount misconfigured), we can still reload from memory
+	// so the service remains usable via WebUI.
 	nodesFilePath := m.getNodesFilePath()
+	writeErrMsg := ""
 	if err := m.writeNodesToFile(nodesFilePath, nodes); err != nil {
-		m.logger.Errorf("failed to write nodes.txt: %v", err)
-		m.mu.Lock()
-		m.status.LastError = fmt.Sprintf("write nodes.txt: %v", err)
-		m.status.LastRefresh = time.Now()
-		m.mu.Unlock()
-		return
-	}
-	m.logger.Infof("written %d nodes to %s", len(nodes), nodesFilePath)
-
-	// Update hash and mod time after writing
-	newHash := m.computeNodesHash(nodes)
-	m.mu.Lock()
-	m.lastSubHash = newHash
-	if info, err := os.Stat(nodesFilePath); err == nil {
-		m.lastNodesModTime = info.ModTime()
+		writeErrMsg = fmt.Sprintf("write nodes.txt failed: %v", err)
+		if info, statErr := os.Stat(nodesFilePath); statErr == nil && info.IsDir() {
+			writeErrMsg += " (nodes.txt is a directory; if using Docker bind mount, ensure host nodes.txt exists as a file)"
+		}
+		m.logger.Warnf("%s", writeErrMsg)
 	} else {
-		m.lastNodesModTime = time.Now()
+		m.logger.Infof("written %d nodes to %s", len(nodes), nodesFilePath)
+
+		// Update hash and mod time after writing
+		newHash := m.computeNodesHash(nodes)
+		m.mu.Lock()
+		m.lastSubHash = newHash
+		if info, err := os.Stat(nodesFilePath); err == nil {
+			m.lastNodesModTime = info.ModTime()
+		} else {
+			m.lastNodesModTime = time.Now()
+		}
+		m.status.NodesModified = false
+		m.mu.Unlock()
 	}
-	m.status.NodesModified = false
-	m.mu.Unlock()
 
 	// Get current port mapping to preserve existing node ports
 	portMap := m.boxMgr.CurrentPortMap()
@@ -423,7 +426,11 @@ func (m *Manager) doRefresh() {
 	if err := m.boxMgr.ReloadWithPortMap(newCfg, portMap); err != nil {
 		m.logger.Errorf("reload failed: %v", err)
 		m.mu.Lock()
-		m.status.LastError = err.Error()
+		if writeErrMsg != "" {
+			m.status.LastError = writeErrMsg + "; " + err.Error()
+		} else {
+			m.status.LastError = err.Error()
+		}
 		m.status.LastRefresh = time.Now()
 		m.mu.Unlock()
 		return
@@ -432,7 +439,7 @@ func (m *Manager) doRefresh() {
 	m.mu.Lock()
 	m.status.LastRefresh = time.Now()
 	m.status.NodeCount = len(nodes)
-	m.status.LastError = ""
+	m.status.LastError = writeErrMsg
 	m.mu.Unlock()
 
 	m.logger.Infof("subscription refresh completed, %d nodes active", len(nodes))
