@@ -234,6 +234,24 @@ func buildNodeOutbound(tag, rawURI string, skipCertVerify bool, connectTimeout t
 		return option.Outbound{}, fmt.Errorf("parse uri: %w", err)
 	}
 	switch strings.ToLower(parsed.Scheme) {
+	case "http", "https":
+		opts, err := buildHTTPProxyOptions(parsed, skipCertVerify)
+		if err != nil {
+			return option.Outbound{}, err
+		}
+		if connectTimeout > 0 && opts.ConnectTimeout == 0 {
+			opts.ConnectTimeout = badoption.Duration(connectTimeout)
+		}
+		return option.Outbound{Type: C.TypeHTTP, Tag: tag, Options: &opts}, nil
+	case "socks", "socks5", "socks4", "socks4a":
+		opts, err := buildSOCKSProxyOptions(parsed)
+		if err != nil {
+			return option.Outbound{}, err
+		}
+		if connectTimeout > 0 && opts.ConnectTimeout == 0 {
+			opts.ConnectTimeout = badoption.Duration(connectTimeout)
+		}
+		return option.Outbound{Type: C.TypeSOCKS, Tag: tag, Options: &opts}, nil
 	case "vless":
 		opts, err := buildVLESSOptions(parsed, skipCertVerify)
 		if err != nil {
@@ -282,6 +300,97 @@ func buildNodeOutbound(tag, rawURI string, skipCertVerify bool, connectTimeout t
 	default:
 		return option.Outbound{}, fmt.Errorf("unsupported scheme %q", parsed.Scheme)
 	}
+}
+
+func buildHTTPProxyOptions(u *url.URL, skipCertVerify bool) (option.HTTPOutboundOptions, error) {
+	if u == nil {
+		return option.HTTPOutboundOptions{}, errors.New("nil url")
+	}
+
+	defaultPort := 80
+	if strings.EqualFold(u.Scheme, "https") {
+		defaultPort = 443
+	}
+	server, port, err := hostPort(u, defaultPort)
+	if err != nil {
+		return option.HTTPOutboundOptions{}, err
+	}
+
+	var username, password string
+	if u.User != nil {
+		username = u.User.Username()
+		if p, ok := u.User.Password(); ok {
+			password = p
+		}
+	}
+
+	opts := option.HTTPOutboundOptions{
+		ServerOptions: option.ServerOptions{Server: server, ServerPort: uint16(port)},
+		Username:      username,
+		Password:      password,
+	}
+
+	// Optional path support (rare for HTTP proxy, but supported by sing-box).
+	if p := strings.TrimSpace(u.EscapedPath()); p != "" && p != "/" {
+		opts.Path = p
+	}
+
+	// HTTPS proxy (HTTP CONNECT over TLS to proxy server).
+	if strings.EqualFold(u.Scheme, "https") {
+		tlsOptions := &option.OutboundTLSOptions{
+			Enabled:    true,
+			Insecure:   skipCertVerify,
+			ServerName: server,
+		}
+		q := u.Query()
+		if sni := strings.TrimSpace(q.Get("sni")); sni != "" {
+			tlsOptions.ServerName = sni
+		} else if serverName := strings.TrimSpace(q.Get("servername")); serverName != "" {
+			tlsOptions.ServerName = serverName
+		} else if peer := strings.TrimSpace(q.Get("peer")); peer != "" {
+			tlsOptions.ServerName = peer
+		}
+		opts.OutboundTLSOptionsContainer = option.OutboundTLSOptionsContainer{TLS: tlsOptions}
+	}
+
+	return opts, nil
+}
+
+func buildSOCKSProxyOptions(u *url.URL) (option.SOCKSOutboundOptions, error) {
+	if u == nil {
+		return option.SOCKSOutboundOptions{}, errors.New("nil url")
+	}
+	server, port, err := hostPort(u, 1080)
+	if err != nil {
+		return option.SOCKSOutboundOptions{}, err
+	}
+
+	var username, password string
+	if u.User != nil {
+		username = u.User.Username()
+		if p, ok := u.User.Password(); ok {
+			password = p
+		}
+	}
+
+	version := ""
+	switch strings.ToLower(strings.TrimSpace(u.Scheme)) {
+	case "socks4":
+		version = "4"
+	case "socks4a":
+		version = "4a"
+	default:
+		version = "5"
+	}
+
+	opts := option.SOCKSOutboundOptions{
+		ServerOptions: option.ServerOptions{Server: server, ServerPort: uint16(port)},
+		Version:       version,
+		Username:      username,
+		Password:      password,
+		Network:       option.NetworkList(""),
+	}
+	return opts, nil
 }
 
 func buildVLESSOptions(u *url.URL, skipCertVerify bool) (option.VLESSOutboundOptions, error) {

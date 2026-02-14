@@ -909,12 +909,37 @@ func extractNameFromVMessURI(uri string) string {
 
 // isProxyURI checks if a string is a valid proxy URI
 func isProxyURI(s string) bool {
-	schemes := []string{"vmess://", "vless://", "trojan://", "ss://", "ssr://", "hysteria://", "hysteria2://", "hy2://"}
+	schemes := []string{"vmess://", "vless://", "trojan://", "ss://", "ssr://", "hysteria://", "hysteria2://", "hy2://", "socks://", "socks5://", "socks4://", "socks4a://"}
 	for _, scheme := range schemes {
 		if strings.HasPrefix(strings.ToLower(s), scheme) {
 			return true
 		}
 	}
+
+	// HTTP/HTTPS proxy URI support (strict to avoid matching random website URLs or HTML pages).
+	//
+	// Requirements:
+	// - scheme is http/https
+	// - explicit port is present (e.g. http://1.2.3.4:8080)
+	// - path is empty or "/"
+	lower := strings.ToLower(strings.TrimSpace(s))
+	if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {
+		u, err := url.Parse(strings.TrimSpace(s))
+		if err != nil {
+			return false
+		}
+		if strings.TrimSpace(u.Hostname()) == "" {
+			return false
+		}
+		if strings.TrimSpace(u.Port()) == "" {
+			return false
+		}
+		if u.Path != "" && u.Path != "/" {
+			return false
+		}
+		return true
+	}
+
 	return false
 }
 
@@ -929,6 +954,7 @@ type clashProxy struct {
 	Server            string                 `yaml:"server"`
 	Port              int                    `yaml:"port"`
 	UUID              string                 `yaml:"uuid"`
+	Username          string                 `yaml:"username"`
 	Password          string                 `yaml:"password"`
 	Cipher            string                 `yaml:"cipher"`
 	AlterId           int                    `yaml:"alterId"`
@@ -995,6 +1021,10 @@ func convertClashProxyToURI(p clashProxy) string {
 		return buildShadowsocksURI(p)
 	case "hysteria2", "hy2":
 		return buildHysteria2URI(p)
+	case "http":
+		return buildHTTPProxyURI(p)
+	case "socks", "socks5", "socks4", "socks4a":
+		return buildSOCKSProxyURI(p)
 	default:
 		return ""
 	}
@@ -1137,6 +1167,59 @@ func buildHysteria2URI(p clashProxy) string {
 	}
 
 	return fmt.Sprintf("hysteria2://%s@%s:%d%s#%s", p.Password, p.Server, p.Port, query, url.QueryEscape(p.Name))
+}
+
+func buildHTTPProxyURI(p clashProxy) string {
+	scheme := "http"
+	if p.TLS {
+		scheme = "https"
+	}
+
+	userInfo := ""
+	if p.Username != "" {
+		if p.Password != "" {
+			userInfo = url.UserPassword(p.Username, p.Password).String() + "@"
+		} else {
+			userInfo = url.User(p.Username).String() + "@"
+		}
+	}
+
+	params := url.Values{}
+	if p.ServerName != "" {
+		params.Set("sni", p.ServerName)
+	} else if p.SNI != "" {
+		params.Set("sni", p.SNI)
+	}
+
+	query := ""
+	if len(params) > 0 {
+		query = "?" + params.Encode()
+	}
+
+	return fmt.Sprintf("%s://%s%s:%d%s#%s", scheme, userInfo, p.Server, p.Port, query, url.QueryEscape(p.Name))
+}
+
+func buildSOCKSProxyURI(p clashProxy) string {
+	scheme := strings.ToLower(strings.TrimSpace(p.Type))
+	switch scheme {
+	case "socks4", "socks4a", "socks5":
+		// keep as-is
+	case "socks":
+		scheme = "socks5"
+	default:
+		scheme = "socks5"
+	}
+
+	userInfo := ""
+	if p.Username != "" {
+		if p.Password != "" {
+			userInfo = url.UserPassword(p.Username, p.Password).String() + "@"
+		} else {
+			userInfo = url.User(p.Username).String() + "@"
+		}
+	}
+
+	return fmt.Sprintf("%s://%s%s:%d#%s", scheme, userInfo, p.Server, p.Port, url.QueryEscape(p.Name))
 }
 
 // FilePath returns the config file path.

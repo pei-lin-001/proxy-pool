@@ -1362,7 +1362,8 @@
         </div>
         <div class="form-group">
           <label class="form-label" for="nodeUri">节点 URI <span style="color: var(--error);">*</span></label>
-          <input type="text" id="nodeUri" class="form-input" placeholder="vless://... 或 vmess://..." required />
+          <input type="text" id="nodeUri" class="form-input" placeholder="vless://... / vmess://... / http(s)://user:pass@ip:port / socks5://user:pass@ip:port" required />
+          <p class="form-help">支持：vless/vmess/trojan/ss(hadowsocks)/hysteria2、以及上游 http(s) 代理、socks5/4 代理</p>
         </div>
         <div class="form-group">
           <label class="form-label" for="nodePort">端口 (可选，Multi-Port 模式自动分配)</label>
