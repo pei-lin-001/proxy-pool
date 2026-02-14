@@ -3028,7 +3028,8 @@
     // 加载配置节点列表
     async function loadConfigNodes() {
       try {
-        const res = await fetch('/api/nodes/config');
+        // Show GeoIP for custom(inline) nodes by default for easier region filtering/debugging.
+        const res = await fetch('/api/nodes/config?geo=inline');
         if (res.status === 401) {
           showToast('请先登录', 'error');
           document.getElementById('loginOverlay').classList.add('show');
@@ -3066,11 +3067,27 @@
       emptyState.style.display = 'none';
       container.innerHTML = configNodes.map((node, index) => {
         const truncatedUri = node.uri.length > 60 ? node.uri.substring(0, 60) + '...' : node.uri;
+        const geo = node.geo || null;
+        let geoText = '';
+        let geoTitle = '';
+        if (geo) {
+          const parts = [geo.country_code, geo.country, geo.region, geo.city].filter(Boolean);
+          if (parts.length > 0) {
+            geoText = parts.join(' ');
+            const extra = [geo.ip ? `IP ${geo.ip}` : '', geo.asn || '', geo.isp || ''].filter(Boolean).join(' · ');
+            geoTitle = extra;
+          } else if (geo.error) {
+            geoText = 'GeoIP 失败';
+            geoTitle = geo.error;
+          }
+        }
         return `
           <div class="config-node-card" data-index="${index}">
             <div class="config-node-info">
               <div class="config-node-name">${escapeHtml(node.name)}</div>
               <div class="config-node-uri" title="${escapeHtml(node.uri)}">${escapeHtml(truncatedUri)}</div>
+              ${geoText ? `<div class="config-node-port" style="opacity:0.9;" ${geoTitle ? `title="${escapeHtml(geoTitle)}"` : ''}>📍 ${escapeHtml(geoText)}</div>` : ''}
+              ${node.source ? `<div class="config-node-port" style="opacity:0.75;">来源: ${escapeHtml(node.source)}</div>` : ''}
               ${node.port ? `<div class="config-node-port">端口: ${node.port}</div>` : ''}
             </div>
             <div class="config-node-actions">

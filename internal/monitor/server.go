@@ -12,8 +12,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"strconv"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -139,10 +139,10 @@ type settingsSnapshot struct {
 	Mode     string `json:"mode"`
 	LogLevel string `json:"log_level"`
 
-	ConnectTimeout string        `json:"connect_timeout"`
-	Listener       listenerView  `json:"listener"`
-	MultiPort      multiPortView `json:"multi_port"`
-	Pool           poolView      `json:"pool"`
+	ConnectTimeout string         `json:"connect_timeout"`
+	Listener       listenerView   `json:"listener"`
+	MultiPort      multiPortView  `json:"multi_port"`
+	Pool           poolView       `json:"pool"`
 	Management     managementView `json:"management"`
 
 	ExternalIP          string                  `json:"external_ip"`
@@ -1405,6 +1405,32 @@ func (s *Server) handleConfigNodes(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			s.respondNodeError(w, err)
 			return
+		}
+		geoScope := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("geo")))
+		switch geoScope {
+		case "1", "true", "all":
+			// Resolve GeoIP in-memory (best effort). This does not persist anything.
+			tmp := &config.Config{Nodes: nodes}
+			tmp.PopulateNodeGeo(r.Context())
+			nodes = tmp.Nodes
+		case "inline", "custom":
+			// Resolve GeoIP only for inline(custom) nodes to avoid heavy work when many subscription nodes exist.
+			subset := make([]config.NodeConfig, 0, len(nodes))
+			indexMap := make([]int, 0, len(nodes))
+			for i, n := range nodes {
+				if n.Source != config.NodeSourceInline {
+					continue
+				}
+				subset = append(subset, n)
+				indexMap = append(indexMap, i)
+			}
+			if len(subset) > 0 {
+				tmp := &config.Config{Nodes: subset}
+				tmp.PopulateNodeGeo(r.Context())
+				for j, idx := range indexMap {
+					nodes[idx].Geo = tmp.Nodes[j].Geo
+				}
+			}
 		}
 		writeJSON(w, map[string]any{"nodes": nodes})
 	case http.MethodPost:
