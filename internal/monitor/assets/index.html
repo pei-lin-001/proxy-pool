@@ -3010,6 +3010,96 @@
     let configNodes = [];
     let isEditMode = false;
 
+    function buildGeoTextForFilter(geo) {
+      if (!geo || geo.error) return '';
+      const parts = [geo.country_code, geo.country, geo.region, geo.city, geo.asn, geo.isp].filter(Boolean);
+      return parts.join(' ').trim();
+    }
+
+    function normalizeStringArray(arr) {
+      if (!Array.isArray(arr)) return [];
+      return arr.map(s => String(s || '').trim()).filter(Boolean);
+    }
+
+    function compileBestEffortRegex(pattern) {
+      const raw = String(pattern || '');
+      if (!raw) return null;
+      let flags = '';
+      let p = raw;
+      // Basic support for Go inline (?i) at the start.
+      if (p.startsWith('(?i)')) {
+        flags = 'i';
+        p = p.slice(4);
+      }
+      try {
+        return new RegExp(p, flags);
+      } catch (_) {
+        return null;
+      }
+    }
+
+    function textMatchesAny(text, patterns, useRegex) {
+      const value = String(text || '').trim();
+      if (!value) return false;
+      const list = normalizeStringArray(patterns);
+      if (list.length === 0) return false;
+
+      if (useRegex) {
+        for (const p of list) {
+          const re = compileBestEffortRegex(p);
+          if (re) {
+            if (re.test(value)) return true;
+            continue;
+          }
+          // Fallback to substring matching if regex compilation fails.
+          if (value.toLowerCase().includes(p.toLowerCase())) return true;
+        }
+        return false;
+      }
+
+      const lower = value.toLowerCase();
+      return list.some(p => lower.includes(p.toLowerCase()));
+    }
+
+    function evaluateNodeFilter(node, filter) {
+      const target = String(filter?.target || 'name').trim().toLowerCase() || 'name';
+      const include = normalizeStringArray(filter?.include);
+      const exclude = normalizeStringArray(filter?.exclude);
+      const useRegex = !!filter?.use_regex;
+      const hasAny = include.length > 0 || exclude.length > 0;
+
+      if (!hasAny) return { match: null, reason: '' };
+
+      const nameText = String(node?.name || '').trim() || String(node?.uri || '').trim();
+      const geoText = buildGeoTextForFilter(node?.geo);
+
+      const values = (() => {
+        if (target === 'geo') return [{ key: 'geo', text: geoText }];
+        if (target === 'name_or_geo') return [{ key: 'name', text: nameText }, { key: 'geo', text: geoText }];
+        return [{ key: 'name', text: nameText }];
+      })();
+
+      if (target === 'geo' && !geoText && (include.length > 0 || exclude.length > 0)) {
+        return { match: false, reason: 'GeoIP 未解析，无法按地区筛选该节点' };
+      }
+
+      if (include.length > 0) {
+        const ok = values.some(v => textMatchesAny(v.text, include, useRegex));
+        if (!ok) {
+          return { match: false, reason: '未命中 include（包含）条件' };
+        }
+      }
+
+      if (exclude.length > 0) {
+        const hit = values.some(v => textMatchesAny(v.text, exclude, useRegex));
+        if (hit) {
+          return { match: false, reason: '命中 exclude（排除）条件' };
+        }
+      }
+
+      return { match: true, reason: '' };
+    }
+
     // Tab 切换
     function switchTab(tabName) {
       document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
@@ -3029,15 +3119,37 @@
     async function loadConfigNodes() {
       try {
         // Show GeoIP for custom(inline) nodes by default for easier region filtering/debugging.
-        const res = await fetch('/api/nodes/config?geo=inline');
-        if (res.status === 401) {
+        // Also load runtime nodes to show whether each config node is currently active.
+        const [cfgRes, runtimeRes] = await Promise.all([
+          fetch('/api/nodes/config?geo=inline'),
+          fetch('/api/nodes')
+        ]);
+        if (cfgRes.status === 401 || runtimeRes.status === 401) {
           showToast('请先登录', 'error');
           document.getElementById('loginOverlay').classList.add('show');
           return;
         }
-        if (!res.ok) throw new Error('加载失败');
-        const data = await res.json();
-        configNodes = data.nodes || [];
+        if (!cfgRes.ok) throw new Error('加载失败');
+        const data = await cfgRes.json();
+        const runtimeData = runtimeRes.ok ? await runtimeRes.json().catch(() => ({})) : {};
+        const activeURIs = new Set((runtimeData.nodes || []).map(n => String(n?.uri || '').trim()).filter(Boolean));
+        const filter = settingsCache?.node_filter || null;
+        const filterHasAny = filter && ((filter.include && filter.include.length) || (filter.exclude && filter.exclude.length));
+
+        configNodes = (data.nodes || []).map(n => {
+          const node = { ...n };
+          const uri = String(node.uri || '').trim();
+          node.active = !!(uri && activeURIs.has(uri));
+          if (filterHasAny) {
+            const evalRes = evaluateNodeFilter(node, filter);
+            node.filter_match = evalRes.match;
+            node.filter_reason = evalRes.reason;
+          } else {
+            node.filter_match = null;
+            node.filter_reason = '';
+          }
+          return node;
+        });
         renderConfigNodes();
 
         // Check if subscription mode is active and show warning
@@ -3081,11 +3193,20 @@
             geoTitle = geo.error;
           }
         }
+        const activeText = (typeof node.active === 'boolean')
+          ? (node.active ? '✅ 已生效' : '⏸ 未生效')
+          : '';
+        const activeTitle = node.active ? '当前运行实例已加载该节点' : '当前运行实例未加载该节点（可能未重载/被筛选/构建失败）';
+        const filterText = (node.filter_match === true)
+          ? '🔎 匹配筛选'
+          : (node.filter_match === false ? '🚫 被筛选排除' : '');
         return `
           <div class="config-node-card" data-index="${index}">
             <div class="config-node-info">
               <div class="config-node-name">${escapeHtml(node.name)}</div>
               <div class="config-node-uri" title="${escapeHtml(node.uri)}">${escapeHtml(truncatedUri)}</div>
+              ${activeText ? `<div class="config-node-port" style="opacity:0.85; color: ${node.active ? 'var(--success)' : 'var(--text-secondary)'};" title="${escapeHtml(activeTitle)}">${escapeHtml(activeText)}</div>` : ''}
+              ${filterText ? `<div class="config-node-port" style="opacity:0.85; color: ${node.filter_match ? 'var(--primary)' : 'var(--warning)'};" ${node.filter_reason ? `title="${escapeHtml(node.filter_reason)}"` : ''}>${escapeHtml(filterText)}</div>` : ''}
               ${geoText ? `<div class="config-node-port" style="opacity:0.9;" ${geoTitle ? `title="${escapeHtml(geoTitle)}"` : ''}>📍 ${escapeHtml(geoText)}</div>` : ''}
               ${node.source ? `<div class="config-node-port" style="opacity:0.75;">来源: ${escapeHtml(node.source)}</div>` : ''}
               ${node.port ? `<div class="config-node-port">端口: ${node.port}</div>` : ''}
